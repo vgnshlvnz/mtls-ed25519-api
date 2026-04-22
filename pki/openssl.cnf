@@ -1,0 +1,47 @@
+# OpenSSL config for the mTLS ED25519 PKI.
+#
+# Used two ways:
+#   1. `openssl req -x509 -config pki/openssl.cnf -extensions v3_ca`
+#        — self-signed CA generation.
+#   2. `openssl x509 -req -extfile pki/openssl.cnf -extensions v3_{server,client}`
+#        — leaf cert signing by the CA.
+#
+# Distinguished Name fields are always provided via `-subj` on the CLI,
+# so the [req_dn] section is intentionally empty.
+
+[req]
+distinguished_name = req_dn
+prompt             = no
+
+[req_dn]
+# Subject DN is supplied via `-subj` to keep this file static and reviewable.
+
+# --- Certificate Authority ---------------------------------------------------
+# CA:TRUE is the core trust-anchor claim; keyCertSign + cRLSign are the only
+# usages a CA needs (ED25519 keys cannot do key transport anyway).
+[v3_ca]
+basicConstraints     = critical, CA:TRUE
+keyUsage             = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+
+# --- Server leaf -------------------------------------------------------------
+# serverAuth EKU is what ssl.CERT_REQUIRED peers check on the client side.
+# SAN covers localhost + 127.0.0.1 to match the planned bind address.
+[v3_server]
+basicConstraints       = CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = serverAuth
+subjectAltName         = DNS:localhost, IP:127.0.0.1
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid, issuer
+
+# --- Client leaf ------------------------------------------------------------
+# clientAuth EKU is what the server checks during mTLS handshake.
+# No SAN: client identity is carried in the Subject CN (see allowlist logic,
+# Phase 3).
+[v3_client]
+basicConstraints       = CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = clientAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid, issuer
