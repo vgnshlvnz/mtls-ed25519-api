@@ -1,10 +1,16 @@
-"""mTLS REST API server — Phase 2 entrypoint.
+"""mTLS REST API server — Phase 3 entrypoint.
 
-Binds to 127.0.0.1:8443 behind strict mutual-TLS (client cert required,
-ED25519-only chain back to pki/ca/ca.crt). The authenticated client identity
-is extracted from the peer cert's Subject CN in middleware and attached to
-``request.state.client_cn``; Phase 3 will plug an allowlist check into the
-same middleware.
+Binds to 127.0.0.1:8443 behind strict mutual-TLS. Security is enforced at
+two distinct layers, intentionally:
+
+* **TLS layer** (``tls.build_server_context``): the ssl module rejects any
+  peer that does not present a cert chaining to ``pki/ca/ca.crt``.
+  "No cert" and "cert signed by unknown CA" die here, before any HTTP
+  bytes are exchanged. Failures are surfaced via an asyncio exception
+  handler installed in :func:`main`.
+* **Application layer** (:class:`middleware.ClientIdentityMiddleware`):
+  a second check enforces an allowlist of Subject CommonNames from
+  ``config.ALLOWED_CLIENT_CNS``. "Valid cert, wrong CN" returns a 403.
 
 Endpoints:
     GET  /health   liveness probe, reports TLS status
@@ -18,20 +24,20 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
+import asyncio.sslproto as _sslproto
 import datetime as dt
 import logging
+import ssl
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import Body, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI
 from pydantic import BaseModel
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.responses import Response
 
+from middleware import ClientIdentityMiddleware
 from tls import CertAwareH11Protocol, build_server_context
 
 
@@ -52,13 +58,7 @@ BIND_PORT = 8443
 
 
 def _configure_logging() -> logging.Logger:
-    """Install the project's single stdout-only log config.
-
-    We set ``force=True`` so this call wins over any handler that uvicorn or
-    a transitive import may have attached earlier. ``uvicorn.access`` is
-    disabled because the per-request middleware below logs richer lines
-    (request-id, CN) that supersede it.
-    """
+    """Install the project's single stdout-only log config."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-5s %(name)s :: %(message)s",
@@ -66,6 +66,8 @@ def _configure_logging() -> logging.Logger:
         stream=sys.stdout,
         force=True,
     )
+    # The middleware emits richer lines (CN, request-id), so uvicorn's
+    # per-request access log is redundant noise.
     logging.getLogger("uvicorn.access").disabled = True
     return logging.getLogger("mtls_api")
 
@@ -101,80 +103,53 @@ class EchoResponse(BaseModel):
 # --- Helpers ----------------------------------------------------------------
 
 
-def _extract_cn(peer_cert: dict[str, Any] | None) -> str | None:
-    """Pull the Subject commonName out of a stdlib-format peer cert dict."""
-    if not peer_cert:
-        return None
-    for rdn in peer_cert.get("subject", ()):
-        for key, value in rdn:
-            if key == "commonName":
-                return value
-    return None
-
-
 def _utcnow_iso() -> str:
     return dt.datetime.now(dt.UTC).isoformat()
 
 
-# --- Middleware -------------------------------------------------------------
+# --- TLS-layer failure logging ----------------------------------------------
+#
+# stdlib's ``asyncio.sslproto.SSLProtocol._fatal_error`` silently swallows
+# SSL handshake failures because ``ssl.SSLError`` inherits from ``OSError``
+# and the stdlib only forwards OSErrors to the loop's exception handler
+# when debug mode is on. See cpython ``Lib/asyncio/sslproto.py`` — the
+# ``if isinstance(exc, OSError):`` branch writes at DEBUG (if debug) and
+# otherwise drops the event on the floor.
+#
+# For an mTLS service that is unacceptable: "peer didn't present a cert"
+# and "cert signed by unknown CA" MUST be visible in ops logs. We wrap
+# the stdlib method with a tiny shim that emits a WARNING before
+# delegating to the original for the normal close sequence. This is a
+# deliberate, documented hook — not a silent override.
 
 
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Tags every request with an id + CN and logs start/end lines.
+_orig_sslproto_fatal_error = _sslproto.SSLProtocol._fatal_error
 
-    Phase 3 will extend this with the client-CN allowlist check. Phase 2
-    only observes and annotates — all verified clients are admitted.
-    """
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: RequestResponseEndpoint,
-    ) -> Response:
-        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
-        peer_cert = request.scope.get("extensions", {}).get("tls", {}).get("peer_cert")
-        client_cn = _extract_cn(peer_cert)
-        peer_addr = request.client.host if request.client else "-"
-
-        request.state.request_id = request_id
-        request.state.client_cn = client_cn
-
-        logger.info(
-            "req_start method=%s path=%s cn=%s reqid=%s peer=%s",
-            request.method,
-            request.url.path,
-            client_cn or "-",
-            request_id,
-            peer_addr,
+def _logging_fatal_error(
+    self: _sslproto.SSLProtocol,
+    exc: BaseException,
+    message: str = "Fatal error on transport",
+) -> None:
+    # SECURITY: log a coarse reason code only. Never include exc.strerror,
+    # exc.args, or cert-chain detail — a misbehaving peer must not be
+    # able to probe our trust store through verbose error messages.
+    if isinstance(exc, ssl.SSLError):
+        logger.warning(
+            "tls_handshake_failed reason=%s library=%s",
+            getattr(exc, "reason", "unknown"),
+            getattr(exc, "library", "unknown"),
         )
+    return _orig_sslproto_fatal_error(self, exc, message)
 
-        try:
-            response = await call_next(request)
-        except Exception as exc:
-            # SECURITY: log internally, respond generically — never leak
-            # stack traces or internal detail across the TLS boundary.
-            logger.exception("req_error reqid=%s :: %s", request_id, exc)
-            response = JSONResponse(
-                status_code=500,
-                content={"error": "internal_error", "request_id": request_id},
-            )
 
-        response.headers["X-Request-ID"] = request_id
-        logger.info(
-            "req_end   method=%s path=%s cn=%s reqid=%s status=%d",
-            request.method,
-            request.url.path,
-            client_cn or "-",
-            request_id,
-            response.status_code,
-        )
-        return response
+_sslproto.SSLProtocol._fatal_error = _logging_fatal_error
 
 
 # --- FastAPI app ------------------------------------------------------------
 
-app = FastAPI(title="mTLS ED25519 REST API", version="0.2.0")
-app.add_middleware(RequestContextMiddleware)
+app = FastAPI(title="mTLS ED25519 REST API", version="0.3.0")
+app.add_middleware(ClientIdentityMiddleware)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -231,8 +206,14 @@ def main() -> None:
         port=BIND_PORT,
         # Force h11 and our cert-aware subclass so scope gets the peer cert.
         http=CertAwareH11Protocol,
-        # The ssl_* params just make uvicorn flip to TLS mode; we override
-        # the context below with our audited one.
+        # SECURITY: force stdlib asyncio. uvloop (shipped by uvicorn[standard])
+        # has its own C-level SSL implementation and bypasses
+        # asyncio.sslproto, so our ``_logging_fatal_error`` hook — the
+        # thing that surfaces TLS handshake failures to ops — is inert
+        # under uvloop. Perf is not a concern at this scale; visibility is.
+        loop="asyncio",
+        # The ssl_* params just flip uvicorn into TLS mode; we override the
+        # context below with our audited one.
         ssl_keyfile=str(SERVER_KEY),
         ssl_certfile=str(SERVER_CERT),
         log_config=None,
@@ -241,12 +222,20 @@ def main() -> None:
     )
     config.load()
     # SECURITY: replace uvicorn's implicitly-built SSLContext with the one
-    # from build_server_context() — that is the single auditable source of
-    # truth for our TLS settings, and it guarantees CERT_REQUIRED.
+    # from build_server_context() — the single auditable source of truth.
     config.ssl = tls_ctx
 
     server = uvicorn.Server(config)
-    server.run()
+
+    # TLS handshake failures are surfaced via the
+    # ``_logging_fatal_error`` hook installed at module import — no
+    # loop-level exception handler is needed. See the SECURITY note
+    # near ``_sslproto.SSLProtocol._fatal_error`` above.
+
+    # asyncio.Runner + uvicorn's loop_factory preserves uvloop selection
+    # when available; falls back to stdlib asyncio otherwise.
+    with asyncio.Runner(loop_factory=config.get_loop_factory()) as runner:
+        runner.run(server.serve())
 
 
 if __name__ == "__main__":
