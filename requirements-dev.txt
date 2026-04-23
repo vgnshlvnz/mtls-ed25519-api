@@ -1,0 +1,12 @@
+# Dev / test dependencies, on top of the runtime deps.
+#
+# Install with:   pip install -r requirements-dev.txt
+#
+# These are only needed when running the Phase-4 test harness or the
+# Phase-3 unittests — the runtime server itself (server.py) has no
+# dependency on requests or httpx.
+
+-r requirements.txt
+
+requests>=2.28,<3.0
+httpx>=0.24,<1.0
