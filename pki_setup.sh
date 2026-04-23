@@ -108,13 +108,28 @@ init_ca_db() {
     [[ -f "${CA_CRLNUMBER}" ]] || printf '01\n' > "${CA_CRLNUMBER}"
 }
 
+# Run an `openssl ca` subcommand from the project root with stderr
+# captured and only re-emitted on failure. Keeps the happy path quiet
+# while preserving the full diagnostic text when something goes wrong
+# (corrupt index.txt, duplicate serial, malformed CSR, …).
+run_openssl_ca() {
+    local stderr_out ec
+    set +e
+    stderr_out=$( cd "${SCRIPT_DIR}" && openssl ca "$@" 2>&1 >/dev/null )
+    ec=$?
+    set -e
+    if [[ ${ec} -ne 0 ]]; then
+        printf '%s\n' "${stderr_out}" >&2
+        fail "openssl ca $* returned ${ec}"
+    fi
+}
+
 # Emit pki/ca/ca.crl. Harmless to call repeatedly — openssl ca rebuilds it
 # from index.txt each time (picks up any freshly-revoked certs).
 # MUST be called from the project root so CA_default paths in openssl.cnf
 # resolve correctly (dir = ./pki/ca).
 gen_crl() {
-    ( cd "${SCRIPT_DIR}" && \
-        openssl ca -config "${CNF}" -gencrl -out "${CA_CRL}" 2>/dev/null )
+    run_openssl_ca -config "${CNF}" -gencrl -out "${CA_CRL}"
     chmod 644 "${CA_CRL}"
 }
 
@@ -176,16 +191,13 @@ gen_leaf() {
     # -notext   : write only the PEM cert (no preamble text dump).
     # -extensions : pull v3_{server,client} from openssl.cnf.
     # Must run from the project root — paths in [CA_default] are relative.
-    (
-        cd "${SCRIPT_DIR}"
-        openssl ca -config "${CNF}" \
-            -batch -notext \
-            -in "${csr}" \
-            -out "${crt}" \
-            -days "${LEAF_DAYS}" \
-            -extensions "${ext}" \
-            -cert "${CA_CRT}" -keyfile "${CA_KEY}" 2>/dev/null
-    )
+    run_openssl_ca -config "${CNF}" \
+        -batch -notext \
+        -in "${csr}" \
+        -out "${crt}" \
+        -days "${LEAF_DAYS}" \
+        -extensions "${ext}" \
+        -cert "${CA_CRT}" -keyfile "${CA_KEY}"
     chmod 644 "${crt}"
 }
 
