@@ -35,6 +35,13 @@ CLI_KEY="${CLIENT_DIR}/client.key"
 CLI_CSR="${CLIENT_DIR}/client.csr"
 CLI_CRT="${CLIENT_DIR}/client.crt"
 
+# Phase-5 CA database state (needed by `openssl ca` for CRL management).
+CA_INDEX="${CA_DIR}/index.txt"
+CA_SERIAL="${CA_DIR}/serial"
+CA_CRLNUMBER="${CA_DIR}/crlnumber"
+CA_NEWCERTS="${CA_DIR}/newcerts"
+CA_CRL="${CA_DIR}/ca.crl"
+
 CA_DAYS=3650    # 10 years
 LEAF_DAYS=365   # 1 year
 
@@ -73,11 +80,38 @@ require_openssl
 mkdir -p "${CA_DIR}" "${SERVER_DIR}" "${CLIENT_DIR}"
 
 if [[ ${FORCE} -eq 1 ]]; then
-    warn "--force: removing existing keys, CSRs, certs, and serial file"
-    rm -f "${CA_KEY}" "${CA_CRT}" "${CA_SRL}"
+    warn "--force: removing existing keys, CSRs, certs, CRL, and CA database"
+    rm -f "${CA_KEY}" "${CA_CRT}" "${CA_SRL}" "${CA_CRL}"
     rm -f "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}"
     rm -f "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}"
+    # Wipe the Phase-5 CA database state so openssl ca starts from serial 01.
+    rm -f "${CA_INDEX}" "${CA_INDEX}.attr" "${CA_INDEX}.old" \
+          "${CA_INDEX}.attr.old" "${CA_SERIAL}" "${CA_SERIAL}.old" \
+          "${CA_CRLNUMBER}" "${CA_CRLNUMBER}.old"
+    rm -rf "${CA_NEWCERTS}"
 fi
+
+# --- CA database (for openssl ca / CRL management) --------------------------
+#
+# `openssl ca` refuses to start if any of these don't exist. We create them
+# as empty/seed values once, then openssl manages them. Skipped cleanly on
+# re-runs when they already exist.
+init_ca_db() {
+    mkdir -p "${CA_NEWCERTS}"
+    [[ -f "${CA_INDEX}" ]]     || : > "${CA_INDEX}"
+    [[ -f "${CA_SERIAL}" ]]    || printf '01\n' > "${CA_SERIAL}"
+    [[ -f "${CA_CRLNUMBER}" ]] || printf '01\n' > "${CA_CRLNUMBER}"
+}
+
+# Emit pki/ca/ca.crl. Harmless to call repeatedly — openssl ca rebuilds it
+# from index.txt each time (picks up any freshly-revoked certs).
+# MUST be called from the project root so CA_default paths in openssl.cnf
+# resolve correctly (dir = ./pki/ca).
+gen_crl() {
+    ( cd "${SCRIPT_DIR}" && \
+        openssl ca -config "${CNF}" -gencrl -out "${CA_CRL}" 2>/dev/null )
+    chmod 644 "${CA_CRL}"
+}
 
 # --- CA ---------------------------------------------------------------------
 gen_ca() {
@@ -107,6 +141,11 @@ gen_ca() {
 
 # --- Leaf signing helper ----------------------------------------------------
 # Args: <label> <key> <csr> <crt> <subj> <extension-section>
+#
+# Uses `openssl ca` (not `openssl x509 -req`) so the issued cert is
+# registered in pki/ca/index.txt. That registration is what makes Phase-5
+# revocation work: `openssl ca -revoke` needs to find the cert's serial in
+# index.txt to mark it R(evoked) and have it appear in the next CRL.
 gen_leaf() {
     local label="$1" key="$2" csr="$3" crt="$4" subj="$5" ext="$6"
 
@@ -120,7 +159,7 @@ gen_leaf() {
     chmod 600 "${key}"
 
     info "Creating ${label} CSR"
-    # CSR carries the DN only; extensions are applied at signing time via -extfile.
+    # CSR carries the DN only; extensions are applied at signing time.
     openssl req -new \
         -key "${key}" \
         -out "${csr}" \
@@ -128,15 +167,20 @@ gen_leaf() {
         -config "${CNF}"
 
     info "Signing ${label} cert with CA (${LEAF_DAYS} days)"
-    # -CAcreateserial : create pki/ca/ca.srl on first run, reuse thereafter.
-    # -extfile/-extensions : attach serverAuth/clientAuth + SAN from openssl.cnf.
-    openssl x509 -req \
-        -in "${csr}" \
-        -CA "${CA_CRT}" -CAkey "${CA_KEY}" -CAcreateserial \
-        -out "${crt}" \
-        -days "${LEAF_DAYS}" \
-        -extfile "${CNF}" \
-        -extensions "${ext}"
+    # -batch    : don't prompt for confirmation.
+    # -notext   : write only the PEM cert (no preamble text dump).
+    # -extensions : pull v3_{server,client} from openssl.cnf.
+    # Must run from the project root — paths in [CA_default] are relative.
+    (
+        cd "${SCRIPT_DIR}"
+        openssl ca -config "${CNF}" \
+            -batch -notext \
+            -in "${csr}" \
+            -out "${crt}" \
+            -days "${LEAF_DAYS}" \
+            -extensions "${ext}" \
+            -cert "${CA_CRT}" -keyfile "${CA_KEY}" 2>/dev/null
+    )
     chmod 644 "${crt}"
 }
 
@@ -170,6 +214,17 @@ print_cert_info() {
 
 # --- Main -------------------------------------------------------------------
 gen_ca
+
+# CA DB and an initial empty CRL land right after the CA is minted. They are
+# only needed by the Phase-5 revoke flow, but generating them here means
+# `openssl ca` is ready to use the moment the CA exists, without a separate
+# "init" step.
+init_ca_db
+if [[ ! -f "${CA_CRL}" ]]; then
+    info "Generating initial (empty) CRL -> ${CA_CRL##*/}"
+    gen_crl
+fi
+
 gen_leaf "server" "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}" \
     "/CN=server/O=Lab/C=MY" "v3_server"
 gen_leaf "client" "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}" \
