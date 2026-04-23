@@ -17,22 +17,30 @@ auditable. It contributes two things:
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 from pathlib import Path
 from typing import Any
 
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
+logger = logging.getLogger(__name__)
+
 
 def build_server_context(
     server_cert: Path,
     server_key: Path,
     ca_cert: Path,
+    crl: Path | None = None,
 ) -> ssl.SSLContext:
     """Build the server-side SSLContext used to terminate mTLS connections.
 
     Any peer that fails verification against ``ca_cert`` is rejected during
     the TLS handshake, before the HTTP layer ever sees the request.
+
+    If ``crl`` is a real file, the CRL PEM is loaded into the context and
+    ``VERIFY_CRL_CHECK_LEAF`` is set. A revoked client cert is then
+    rejected at the same handshake stage as an untrusted one.
     """
     # SECURITY: fail fast if any cert/key file is missing — the server must
     # never start with a half-broken TLS stack. A misconfigured path that
@@ -60,6 +68,31 @@ def build_server_context(
 
     # Trust anchor against which incoming client certs are verified.
     ctx.load_verify_locations(cafile=str(ca_cert))
+
+    # SECURITY: if a CRL is available, load it and enable CRL checking.
+    # VERIFY_CRL_CHECK_LEAF is the narrow form — OpenSSL checks the client
+    # (leaf) cert against the loaded CRL. Project rules require either
+    # CHECK_LEAF or CHECK_CHAIN; we pick LEAF because we only have one
+    # issuing CA and no intermediate certs to worry about.
+    #
+    # NOTE: SSLContext caches the CRL at load time. If you revoke a cert
+    # while the server is running you must restart the process (or
+    # arrange a reload hook) for the new CRL to take effect.
+    if crl is not None and crl.is_file():
+        # OpenSSL's X509_STORE_load_locations accepts a PEM file that
+        # contains CERTIFICATE or X509 CRL blocks (or both). Loading the
+        # CRL via cafile= adds the CRL to the same store the CA cert
+        # lives in. cadata= is stricter and rejects CRL-only PEM
+        # payloads ("cadata does not contain a certificate"), so we
+        # use cafile here.
+        ctx.load_verify_locations(cafile=str(crl))
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+        logger.info("crl_loaded path=%s mode=VERIFY_CRL_CHECK_LEAF", crl)
+    else:
+        logger.warning(
+            "crl_not_loaded path=%s — revoked certs will NOT be rejected",
+            crl if crl else "(disabled)",
+        )
 
     # Server-side SSLContexts don't validate the peer's hostname — clients do
     # that on the other side of the connection. We identify authenticated

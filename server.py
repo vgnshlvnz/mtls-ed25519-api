@@ -49,6 +49,7 @@ PKI_DIR = PROJECT_ROOT / "pki"
 SERVER_CERT = PKI_DIR / "server" / "server.crt"
 SERVER_KEY = PKI_DIR / "server" / "server.key"
 CA_CERT = PKI_DIR / "ca" / "ca.crt"
+CA_CRL = PKI_DIR / "ca" / "ca.crl"
 
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 8443
@@ -192,6 +193,7 @@ def main() -> None:
         server_cert=SERVER_CERT,
         server_key=SERVER_KEY,
         ca_cert=CA_CERT,
+        crl=CA_CRL,
     )
     logger.info(
         "tls_context mode=CERT_REQUIRED min_version=%s ciphers=%d",
