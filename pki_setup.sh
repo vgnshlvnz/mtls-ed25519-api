@@ -84,6 +84,11 @@ if [[ ${FORCE} -eq 1 ]]; then
     rm -f "${CA_KEY}" "${CA_CRT}" "${CA_SRL}" "${CA_CRL}"
     rm -f "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}"
     rm -f "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}"
+    # server.fingerprint is derived from server.crt and becomes stale the
+    # instant we regenerate; pinned_client.py would then fail with a
+    # mismatch until `make pin` is re-run. `make clean` already removes it;
+    # keep both cleanup paths aligned.
+    rm -f "${SERVER_DIR}/server.fingerprint"
     # Wipe the Phase-5 CA database state so openssl ca starts from serial 01.
     rm -f "${CA_INDEX}" "${CA_INDEX}.attr" "${CA_INDEX}.old" \
           "${CA_INDEX}.attr.old" "${CA_SERIAL}" "${CA_SERIAL}.old" \
