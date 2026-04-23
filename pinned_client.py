@@ -60,8 +60,23 @@ SERVER_PORT = 8443
 
 
 def _normalise_pin(raw: str) -> str:
-    """Strip whitespace/colons and uppercase. Accepts typical openssl output."""
-    return raw.strip().replace(":", "").replace(" ", "").upper()
+    """Strip whitespace/colons, drop any ``openssl x509 -fingerprint`` prefix,
+    and uppercase.
+
+    Accepts every form the docstring advertises:
+      * bare hex                     "AABB...FF"
+      * colon-separated              "AA:BB:...:FF"
+      * openssl one-line output      "SHA256 Fingerprint=AA:BB:...:FF"
+      * same, lowercased             "sha256 Fingerprint=aa:bb:...:ff"
+
+    Splitting on "=" here (rather than only in the file branch) ensures
+    --pin and MTLS_PIN accept the literal output of the documented
+    extraction recipe too, not just file input.
+    """
+    s = raw.strip()
+    if "=" in s:
+        s = s.split("=", 1)[1]
+    return s.replace(":", "").replace(" ", "").upper()
 
 
 def _load_expected_pin(cli_pin: str | None) -> str:
@@ -75,11 +90,7 @@ def _load_expected_pin(cli_pin: str | None) -> str:
     if env:
         return _normalise_pin(env)
     if PIN_FILE.is_file():
-        # Accept formats like "SHA256 Fingerprint=AA:BB:..." or bare hex.
-        content = PIN_FILE.read_text().strip()
-        if "=" in content:
-            content = content.split("=", 1)[1]
-        return _normalise_pin(content)
+        return _normalise_pin(PIN_FILE.read_text())
     raise SystemExit(
         "No pin supplied. Pass --pin, set MTLS_PIN, "
         f"or drop a fingerprint into {PIN_FILE}."
