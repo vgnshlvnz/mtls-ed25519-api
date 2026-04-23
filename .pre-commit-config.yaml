@@ -1,0 +1,48 @@
+repos:
+  # Prevent accidental private key commits
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+
+  # Block any file matching private key patterns
+  - repo: local
+    hooks:
+      - id: no-private-keys
+        # The optional capture group (EC|RSA|OPENSSH) is what makes this
+        # regex also match the bare PKCS#8 header used by Ed25519 keys
+        # (which carry no algorithm prefix). Without the `?`, only
+        # RSA/EC/OpenSSH keys would be blocked.
+        name: Block private key files
+        language: pygrep
+        entry: "-----BEGIN (EC |RSA |OPENSSH )?PRIVATE KEY-----"
+        types: [text]
+        stages: [pre-commit]
+        pass_filenames: true
+
+      - id: no-key-files
+        name: Block .key file commits
+        language: fail
+        entry: "Private key files (.key) must not be committed"
+        files: '\.key$'
+        stages: [pre-commit]
+
+  # Python linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.2
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Shell script linting
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        files: \.(sh)$

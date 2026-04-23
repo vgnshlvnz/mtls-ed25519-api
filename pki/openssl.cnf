@@ -1,0 +1,93 @@
+# OpenSSL config for the mTLS ED25519 PKI.
+#
+# Used three ways:
+#   1. `openssl req -x509 -config pki/openssl.cnf -extensions v3_ca`
+#        — self-signed CA generation.
+#   2. `openssl x509 -req -extfile pki/openssl.cnf -extensions v3_{server,client}`
+#        — leaf cert signing by the CA.
+#   3. `openssl ca -config pki/openssl.cnf -revoke <cert>` and
+#      `openssl ca -config pki/openssl.cnf -gencrl -out ca.crl`
+#        — Phase-5 CRL management via the CA_default section below.
+#
+# Distinguished Name fields are always provided via `-subj` on the CLI,
+# so the [req_dn] section is intentionally empty.
+#
+# Scripts that invoke `openssl ca` MUST cd to the project root first — all
+# CA_default paths are relative to that root.
+
+[req]
+distinguished_name = req_dn
+prompt             = no
+
+[req_dn]
+# Subject DN is supplied via `-subj` to keep this file static and reviewable.
+
+# --- Certificate Authority ---------------------------------------------------
+# CA:TRUE is the core trust-anchor claim; keyCertSign + cRLSign are the only
+# usages a CA needs (ED25519 keys cannot do key transport anyway).
+[v3_ca]
+basicConstraints     = critical, CA:TRUE
+keyUsage             = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+
+# --- Server leaf -------------------------------------------------------------
+# serverAuth EKU is what ssl.CERT_REQUIRED peers check on the client side.
+# SAN covers localhost + 127.0.0.1 to match the planned bind address.
+[v3_server]
+basicConstraints       = CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = serverAuth
+subjectAltName         = DNS:localhost, IP:127.0.0.1
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid, issuer
+
+# --- Client leaf ------------------------------------------------------------
+# clientAuth EKU is what the server checks during mTLS handshake.
+# No SAN: client identity is carried in the Subject CN (see allowlist logic,
+# Phase 3).
+[v3_client]
+basicConstraints       = CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = clientAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid, issuer
+
+# --- CA administration (Phase 5 CRL management) -----------------------------
+# Used by `openssl ca -revoke` and `openssl ca -gencrl`. These paths are
+# relative to the project root; any script calling `openssl ca` MUST
+# `cd` to the project root first.
+[ca]
+default_ca = CA_default
+
+[CA_default]
+dir               = ./pki/ca
+certs             = $dir
+crl_dir           = $dir
+new_certs_dir     = $dir/newcerts
+database          = $dir/index.txt
+serial            = $dir/serial
+crlnumber         = $dir/crlnumber
+certificate       = $dir/ca.crt
+private_key       = $dir/ca.key
+crl               = $dir/ca.crl
+RANDFILE          = $dir/.rand
+unique_subject    = no
+# Ed25519 does not use a pre-hash, so default_md must be "default" (meaning
+# "use whatever the key algorithm dictates"). Setting it to e.g. sha256
+# causes `openssl ca` to error with "digest is not allowed for this key".
+default_md        = default
+default_days      = 365
+default_crl_days  = 7
+policy            = policy_any
+copy_extensions   = none
+
+[policy_any]
+# Permissive policy for a single-tenant lab CA — every DN field is
+# allowed but only commonName is required. Tighten for production.
+commonName              = supplied
+organizationName        = optional
+countryName             = optional
+stateOrProvinceName     = optional
+localityName            = optional
+organizationalUnitName  = optional
+emailAddress            = optional

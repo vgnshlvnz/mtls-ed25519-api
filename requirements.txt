@@ -1,0 +1,14 @@
+# Runtime dependencies for the mTLS REST API server.
+#
+# Constraints:
+#   - Python 3.11+ (server.py uses datetime.UTC and asyncio.Runner)
+#   - No third-party TLS libs on the server side (stdlib `ssl` only).
+#   - `uvicorn[standard]` pulls in httptools/uvloop/websockets for performance,
+#     but we still use stdlib ssl for the SSLContext — see tls.py.
+#
+# Phase-specific dependencies (httpx/requests for the test harness, ruff for
+# linting, etc.) are added in later phases or a separate requirements-dev.txt.
+
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+pydantic>=2.6,<3.0
