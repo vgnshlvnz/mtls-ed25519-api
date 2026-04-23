@@ -78,7 +78,16 @@ def build_server_context(
     # NOTE: SSLContext caches the CRL at load time. If you revoke a cert
     # while the server is running you must restart the process (or
     # arrange a reload hook) for the new CRL to take effect.
-    if crl is not None and crl.is_file():
+    if crl is not None:
+        # SECURITY: if the caller asked for CRL checking (non-None path),
+        # a missing file is an operator error — fail closed. Silently
+        # dropping to no-CRL would let revoked certs authenticate.
+        # Callers that genuinely want no CRL must pass crl=None.
+        if not crl.is_file():
+            raise FileNotFoundError(
+                f"CRL path supplied but file missing: {crl}. "
+                "Run `./pki_setup.sh` or `./tests/revoke_client.sh` to regenerate."
+            )
         # OpenSSL's X509_STORE_load_locations accepts a PEM file that
         # contains CERTIFICATE or X509 CRL blocks (or both). Loading the
         # CRL via cafile= adds the CRL to the same store the CA cert
@@ -89,10 +98,7 @@ def build_server_context(
         ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
         logger.info("crl_loaded path=%s mode=VERIFY_CRL_CHECK_LEAF", crl)
     else:
-        logger.warning(
-            "crl_not_loaded path=%s — revoked certs will NOT be rejected",
-            crl if crl else "(disabled)",
-        )
+        logger.info("crl_disabled — no revocation checking configured")
 
     # Server-side SSLContexts don't validate the peer's hostname — clients do
     # that on the other side of the connection. We identify authenticated
