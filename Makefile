@@ -39,9 +39,16 @@ define WARN
 endef
 
 # --- Guards -----------------------------------------------------------------
-# Fail early if the venv isn't activated / present.
+# Fail early when a target that actually uses Python is invoked without a
+# venv. Scoping by $(MAKECMDGOALS) so bare `make`, `make help`, `make clean`,
+# `make pki`, `make revoke`, `make renew`, and `make pin` all stay usable on
+# a clean clone that hasn't built its venv yet — they shell out to openssl /
+# bash / awk and never touch Python.
+VENV_REQUIRED_GOALS := server test
+ifneq ($(filter $(VENV_REQUIRED_GOALS),$(MAKECMDGOALS)),)
 ifeq (,$(wildcard $(PY)))
 $(error Python venv not found at '$(VENV)/'. Run: python -m venv venv && source venv/bin/activate && pip install -r requirements-dev.txt)
+endif
 endif
 
 # --- Phony declarations -----------------------------------------------------
@@ -84,6 +91,12 @@ server:  ## Start the FastAPI server in the background (PID -> $(PID_FILE))
 	printf '%b[make]%b server did not become ready. Log tail:\n' \
 		"$(C_RED)" "$(C_RESET)" >&2; \
 	tail -20 $(SERVER_LOG) >&2; \
+	if [[ -f $(PID_FILE) ]]; then \
+		kill "$$(cat $(PID_FILE))" 2>/dev/null || true; \
+		sleep 1; \
+		kill -9 "$$(cat $(PID_FILE))" 2>/dev/null || true; \
+		rm -f $(PID_FILE); \
+	fi; \
 	exit 1
 
 stop:  ## Stop the background server (no-op if not running)
