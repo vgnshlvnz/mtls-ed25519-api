@@ -82,16 +82,25 @@ openssl req -new \
     -config "${CNF}"
 
 info "signing with CA (${LEAF_DAYS} day validity)"
-(
-    cd "${SCRIPT_DIR}"
-    openssl ca -config "${CNF}" \
+# Capture stderr so real failures (corrupt index.txt, duplicate serial,
+# malformed CSR, missing CA key) surface cleanly. Happy path prints
+# nothing from openssl; failures print full diagnostics before exiting.
+set +e
+sign_stderr=$(
+    cd "${SCRIPT_DIR}" && openssl ca -config "${CNF}" \
         -batch -notext \
         -in "${NEW_CSR}" \
         -out "${NEW_CRT}" \
         -days "${LEAF_DAYS}" \
         -extensions v3_client \
-        -cert "${CA_CRT}" -keyfile "${CA_KEY}" 2>/dev/null
+        -cert "${CA_CRT}" -keyfile "${CA_KEY}" 2>&1 >/dev/null
 )
+sign_ec=$?
+set -e
+if [[ ${sign_ec} -ne 0 ]]; then
+    printf '%s\n' "${sign_stderr}" >&2
+    fail "openssl ca (sign) returned ${sign_ec}"
+fi
 chmod 644 "${NEW_CRT}"
 
 # SECURITY: never swap into place if the new cert does not verify against
