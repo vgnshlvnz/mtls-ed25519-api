@@ -1,12 +1,25 @@
+# Private key material — must never be committed
 pki/**/*.key
 pki/**/*.pem
 *.key
 *.p12
 *.pfx
+
+# Regenerable PKI artifacts (script recreates on demand)
+pki/**/*.crt
+pki/**/*.csr
+pki/**/*.srl
+pki/**/*.crl
+
+# CA database state (managed by `openssl ca`, Phase 5)
 pki/ca/index.txt
 pki/ca/index.txt.attr
+pki/ca/index.txt.old
+pki/ca/index.txt.attr.old
 pki/ca/serial
+pki/ca/serial.old
 pki/ca/crlnumber
+pki/ca/crlnumber.old
 pki/ca/newcerts/
 __pycache__/
 *.pyc
@@ -16,3 +29,10 @@ venv/
 *.log
 logs/
 .DS_Store
+
+# Phase-5 server lifecycle (managed by the Makefile)
+.server.pid
+.server.log
+
+# Phase-5 cert-pinning fingerprint (regenerable via `make pin`)
+pki/server/server.fingerprint
