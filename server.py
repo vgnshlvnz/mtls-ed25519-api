@@ -28,7 +28,9 @@ import asyncio
 import asyncio.sslproto as _sslproto
 import datetime as dt
 import logging
+import shutil
 import ssl
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,9 @@ SERVER_CERT = PKI_DIR / "server" / "server.crt"
 SERVER_KEY = PKI_DIR / "server" / "server.key"
 CA_CERT = PKI_DIR / "ca" / "ca.crt"
 CA_CRL = PKI_DIR / "ca" / "ca.crl"
+CA_KEY = PKI_DIR / "ca" / "ca.key"
+OPENSSL_CNF = PKI_DIR / "openssl.cnf"
+CA_INDEX = PKI_DIR / "ca" / "index.txt"
 
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 8443
@@ -183,10 +188,83 @@ async def post_data(payload: dict[str, Any] = Body(...)) -> EchoResponse:
     return EchoResponse(received=payload, echoed_at=_utcnow_iso())
 
 
+# --- CRL freshness ----------------------------------------------------------
+
+
+def _refresh_crl() -> None:
+    """Regenerate pki/ca/ca.crl via `openssl ca -gencrl` before boot.
+
+    The CRL's ``nextUpdate`` is only ``default_crl_days`` (7 days by
+    default in pki/openssl.cnf) past its ``lastUpdate``. If nothing
+    refreshes it, the file expires after a week and OpenSSL's
+    VERIFY_CRL_CHECK_LEAF fails every handshake with
+    ``X509_V_ERR_CRL_HAS_EXPIRED``. Regenerating on each server start
+    pins the CRL's validity window to "now + 7 days" — freshness is
+    owed as long as the server is restarted weekly, which is the same
+    cadence the project already requires for picking up new revocations
+    (see ``tls.build_server_context`` SSLContext-caching note).
+
+    Soft-fail: if openssl is missing from PATH or the CA DB isn't in
+    place yet (fresh clone before ``./pki_setup.sh``), log a WARNING
+    and leave the existing file. ``build_server_context`` will then
+    handle the "CRL present" vs "CRL missing" decision as before.
+    """
+    if not CA_INDEX.is_file() or not CA_KEY.is_file():
+        logger.warning(
+            "crl_refresh_skipped reason=ca_db_missing path=%s",
+            CA_INDEX,
+        )
+        return
+
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        logger.warning("crl_refresh_skipped reason=openssl_not_in_PATH")
+        return
+
+    try:
+        # cwd=PROJECT_ROOT so the relative paths in [CA_default] resolve.
+        # capture_output so stderr doesn't leak onto our stdout log stream.
+        result = subprocess.run(
+            [
+                openssl,
+                "ca",
+                "-config",
+                str(OPENSSL_CNF),
+                "-gencrl",
+                "-out",
+                str(CA_CRL),
+            ],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("crl_refresh_failed reason=%s", exc)
+        return
+
+    if result.returncode != 0:
+        # Log stderr so operators can diagnose a corrupt index.txt etc.
+        logger.warning(
+            "crl_refresh_failed exit=%d stderr=%r",
+            result.returncode,
+            result.stderr.strip()[:400],
+        )
+        return
+
+    logger.info("crl_refreshed path=%s", CA_CRL)
+
+
 # --- Entrypoint -------------------------------------------------------------
 
 
 def main() -> None:
+    # Regenerate the CRL before building the SSLContext, so the loaded
+    # CRL has a fresh nextUpdate. See _refresh_crl docstring for why
+    # this matters — without it the service dies after 7 days.
+    _refresh_crl()
+
     # SECURITY: build the SSLContext up front. A bad path/permission problem
     # must crash the process before we bind the port, not mid-handshake.
     tls_ctx = build_server_context(
