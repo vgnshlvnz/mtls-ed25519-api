@@ -9,6 +9,7 @@ pki/**/*.pem
 pki/**/*.crt
 pki/**/*.csr
 pki/**/*.srl
+pki/**/*.crl
 
 # CA database state (managed by `openssl ca`, Phase 5)
 pki/ca/index.txt
@@ -28,3 +29,10 @@ venv/
 *.log
 logs/
 .DS_Store
+
+# Phase-5 server lifecycle (managed by the Makefile)
+.server.pid
+.server.log
+
+# Phase-5 cert-pinning fingerprint (regenerable via `make pin`)
+pki/server/server.fingerprint
