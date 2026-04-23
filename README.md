@@ -139,7 +139,9 @@ OCSP responder recipe for local experimentation, is in
 
 ## Requirements
 
-* Python 3.10+ (tested on 3.12)
+* Python 3.11+ (tested on 3.12)
+  — 3.11 is the floor because `server.py` uses `datetime.UTC` and
+  `asyncio.Runner`, both added in that release.
 * OpenSSL 3.x (tested on 3.0.13)
 * GNU make (macOS ships it as `/usr/bin/make`)
 * Bash 4+ (all scripts start with `set -euo pipefail`; `shellcheck` clean)
