@@ -356,6 +356,72 @@ def mirror_existing_ca(
     return ca
 
 
+def make_custom_crl(
+    ca_cert: Path,
+    ca_key: Path,
+    dir: Path,
+    *,
+    revoked_serials: list[int] | None = None,
+    last_update_offset_s: int = 0,
+    next_update_offset_s: int = 7 * 24 * 3600,
+    crl_number: int = 1,
+) -> Path:
+    """Produce a CRL with arbitrary time windows using cryptography.
+
+    ``last_update_offset_s`` and ``next_update_offset_s`` are relative
+    to "now" — positive means future, negative means past. This lets
+    T5 CRL tests produce a CRL whose ``nextUpdate`` is already in
+    the past (the "CRL expiry time bomb" from ultrareview bug004).
+
+    ``revoked_serials`` can be an empty list (valid, empty CRL) or a
+    long one (1000+ entries, for CR5's lookup-speed assertion).
+
+    Returns the path to the PEM CRL file.
+    """
+    # Local imports to keep the module loadable when cryptography is
+    # not installed (only T5 tests need this helper).
+    import datetime as _dt
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.x509 import ReasonFlags
+    from cryptography.x509.oid import NameOID
+
+    dir.mkdir(parents=True, exist_ok=True)
+    crl_path = dir / "custom.crl"
+
+    # Load the CA cert + key.
+    ca_cert_obj = x509.load_pem_x509_certificate(ca_cert.read_bytes())
+    ca_key_obj = serialization.load_pem_private_key(ca_key.read_bytes(), password=None)
+
+    now = _dt.datetime.now(_dt.UTC)
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca_cert_obj.subject)
+        .last_update(now + _dt.timedelta(seconds=last_update_offset_s))
+        .next_update(now + _dt.timedelta(seconds=next_update_offset_s))
+        .add_extension(x509.CRLNumber(crl_number), critical=False)
+    )
+
+    for serial in revoked_serials or []:
+        rev = (
+            x509.RevokedCertificateBuilder()
+            .serial_number(serial)
+            .revocation_date(now)
+            .add_extension(x509.CRLReason(ReasonFlags.unspecified), critical=False)
+            .build()
+        )
+        builder = builder.add_revoked_certificate(rev)
+    # Silence unused-import warning; NameOID is available if a caller
+    # wants to inspect the issuer fields post-build.
+    _ = NameOID
+
+    # Ed25519 CRLs are signed with algorithm=None per RFC 8410.
+    crl = builder.sign(private_key=ca_key_obj, algorithm=None)
+    crl_path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+    crl_path.chmod(0o644)
+    return crl_path
+
+
 def make_self_signed_client(dir: Path, cn: str) -> Leaf:
     """Produce a standalone self-signed client cert (no CA chain at all).
 
