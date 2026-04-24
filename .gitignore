@@ -42,3 +42,11 @@ pki/server/server.fingerprint
 .coverage
 .coverage.*
 htmlcov/
+
+# N1 nginx termination — generated test config + runtime dirs.
+# Keys / certs / CSRs under pki/nginx/ are already caught by the
+# pki/**/*.{key,crt,csr} patterns above; this block covers the
+# nginx-specific runtime state.
+nginx/nginx-test.conf
+nginx/logs/
+nginx/*.pid
