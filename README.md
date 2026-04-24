@@ -1,5 +1,9 @@
 # mTLS REST API with ED25519
 
+[![CI](https://github.com/vgnshlvnz/mtls-ed25519-api/actions/workflows/ci.yml/badge.svg)](https://github.com/vgnshlvnz/mtls-ed25519-api/actions/workflows/ci.yml)
+[![Secret scan](https://github.com/vgnshlvnz/mtls-ed25519-api/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/vgnshlvnz/mtls-ed25519-api/actions/workflows/secret-scan.yml)
+
+
 A small FastAPI server that enforces mutual TLS using **ED25519** keys and a
 self-hosted CA, with a CN allowlist, CRL-based revocation, short-lived
 client certs, and stdlib-only cert pinning.
