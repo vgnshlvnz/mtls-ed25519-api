@@ -33,6 +33,7 @@ logs/
 # Phase-5 server lifecycle (managed by the Makefile)
 .server.pid
 .server.log
+.server-test-*.log
 
 # Phase-5 cert-pinning fingerprint (regenerable via `make pin`)
 pki/server/server.fingerprint

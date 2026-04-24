@@ -74,7 +74,12 @@ async def test_three_endpoints_concurrently_under_budget(
     # Correctness first — we want to know if something is actually
     # broken before we blame the latency guard.
     assert health.status_code == 200
-    assert health.json() == {"status": "ok", "tls": True}
+    health_body = health.json()
+    assert health_body["status"] == "ok"
+    assert health_body["tls"] is True
+    # /health gained a `version` field in T3; presence is enforced
+    # here, exact contract in tests/test_api_contracts.py.
+    assert isinstance(health_body.get("version"), str) and health_body["version"]
 
     assert data.status_code == 200
     data_body = data.json()

@@ -31,7 +31,47 @@ from pathlib import Path
 import pytest
 import requests
 
+from hypothesis import HealthCheck, settings
+
 from tests._pki_factory import RogueCA, make_self_signed_client, mirror_existing_ca
+
+
+# --- Hypothesis profiles (T3 fuzzing) ---------------------------------------
+#
+# Property-based tests in tests/test_api_fuzzing.py hit a live mTLS
+# server, so hypothesis's default per-example deadline (200ms) is
+# occasionally tripped by the ~100-example run. Register explicit
+# profiles here:
+#
+#   default   — 100 examples, 60s per-example deadline, allows function-scoped
+#               fixtures. Picked unless HYPOTHESIS_PROFILE says otherwise.
+#   ci        — same as default but with print_blob=True for reproducibility.
+#   dev       — 25 examples, no deadline; for fast iteration.
+#
+# Select a profile via HYPOTHESIS_PROFILE=<name> or pytest --hypothesis-profile.
+
+_HYPOTHESIS_COMMON_SUPPRESS = (HealthCheck.function_scoped_fixture,)
+
+settings.register_profile(
+    "default",
+    max_examples=100,
+    deadline=60_000,  # 60s per example — plenty for real-network fuzzing
+    suppress_health_check=_HYPOTHESIS_COMMON_SUPPRESS,
+)
+settings.register_profile(
+    "ci",
+    max_examples=100,
+    deadline=60_000,
+    print_blob=True,
+    suppress_health_check=_HYPOTHESIS_COMMON_SUPPRESS,
+)
+settings.register_profile(
+    "dev",
+    max_examples=25,
+    deadline=None,
+    suppress_health_check=_HYPOTHESIS_COMMON_SUPPRESS,
+)
+settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "default"))
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -171,14 +211,72 @@ def server_process(
     # point the child at it so ``sitecustomize.py`` can start recording.
     # Data files land with a parallel suffix and pytest-cov combines them
     # automatically at end-of-run.
-    if "coverage" in sys.modules and (REPO_ROOT / ".coveragerc").is_file():
+    # Always propagate when a .coveragerc is present; sitecustomize.py
+    # turns into a no-op if coverage itself isn't installed, so the
+    # env var is harmless in a non-coverage run. Previously we gated
+    # on ``"coverage" in sys.modules`` in the pytest process, but
+    # pytest-cov can delay its ``coverage`` import past the first
+    # session-scoped fixture — leaving subprocess coverage inert.
+    if (REPO_ROOT / ".coveragerc").is_file():
         env["COVERAGE_PROCESS_START"] = str(REPO_ROOT / ".coveragerc")
 
+    # Route the child's stdout + stderr to a per-session log file on disk.
+    # An in-memory PIPE would fill after ~50-100 requests under fuzzing
+    # (no one on the pytest side drains it) and the server would block
+    # on logging.emit() — a 64KiB pipe-buffer starvation. The log file
+    # is preserved under the tls_attack_tmpdir parent so a failing run
+    # leaves diagnostics on disk.
+    log_path = REPO_ROOT / f".server-test-{port}.log"
+    log_fh = log_path.open("wb")
+
+    # Launch via a tiny inline bootstrap so subprocess coverage fires
+    # regardless of site-packages .pth discovery (pytest-cov launch
+    # conditions have surprised us there). The bootstrap is a no-op
+    # when COVERAGE_PROCESS_START is unset, which is the operational
+    # default.
+    # Uvicorn registers its own SIGTERM handler at startup that wins
+    # a race against coverage.py's sigterm-save hook — and when the
+    # fixture later sends SIGTERM for teardown, uvicorn begins a
+    # graceful shutdown that blocks on open keep-alive connections
+    # and never completes, so coverage data for the child never lands.
+    #
+    # We fix this by monkey-patching ``signal.signal`` in the child
+    # BEFORE uvicorn starts: any SIGTERM handler uvicorn installs is
+    # wrapped so that coverage is flushed FIRST, then uvicorn's
+    # original handler runs. By the time the process is killed the
+    # ``.coverage.<pid>.*`` file is already on disk.
+    bootstrap = (
+        "import os, runpy, signal\n"
+        "_cov = None\n"
+        'if os.environ.get("COVERAGE_PROCESS_START"):\n'
+        "    try:\n"
+        "        import coverage\n"
+        "        coverage.process_startup(force=True)\n"
+        "        _cov = coverage.Coverage.current()\n"
+        "    except ImportError:\n"
+        "        pass\n"
+        "_orig_signal = signal.signal\n"
+        "def _guarded_signal(sig, handler):\n"
+        "    if sig in (signal.SIGTERM, signal.SIGINT) and _cov is not None:\n"
+        "        _user_handler = handler\n"
+        "        def _combined(s, f):\n"
+        "            try:\n"
+        "                _cov.stop()\n"
+        "                _cov.save()\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "            if callable(_user_handler):\n"
+        "                return _user_handler(s, f)\n"
+        "        return _orig_signal(sig, _combined)\n"
+        "    return _orig_signal(sig, handler)\n"
+        "signal.signal = _guarded_signal\n"
+        'runpy.run_path("server.py", run_name="__main__")\n'
+    )
     proc = subprocess.Popen(
-        [sys.executable, "server.py"],
+        [sys.executable, "-c", bootstrap],
         cwd=str(REPO_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_fh,
         stderr=subprocess.STDOUT,
     )
 
@@ -193,16 +291,21 @@ def server_process(
             deadline=deadline,
         )
     except Exception:
-        # Drain whatever the child wrote so the failure is attributable.
+        # Dump the child's log to stderr so the failure is attributable.
         proc.terminate()
         try:
-            out, _ = proc.communicate(timeout=5)
+            proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-            out, _ = proc.communicate()
-        sys.stderr.write(
-            f"\n[server_process] startup failed, child stdout:\n{out.decode(errors='replace')}\n"
-        )
+            proc.wait(timeout=5)
+        log_fh.close()
+        try:
+            sys.stderr.write(
+                f"\n[server_process] startup failed, child log:\n"
+                f"{log_path.read_text(errors='replace')}\n"
+            )
+        except OSError:
+            pass
         raise
 
     try:
@@ -219,6 +322,8 @@ def server_process(
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+        log_fh.close()
+        # Leave log_path on disk for post-mortem; `make clean` removes it.
 
 
 # --- TLS-attack fixtures (T2) -----------------------------------------------
