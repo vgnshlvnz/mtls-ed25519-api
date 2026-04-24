@@ -105,6 +105,60 @@ Server fixture behaviour — the integration suite will pick a random
 free loopback port via `MTLS_API_PORT` when 8443 is already bound,
 so tests are safe to run alongside a backgrounded `make server`.
 
+## Deployment modes (v1.1)
+
+Two supported architectures, switchable via the `NGINX_MODE` env var:
+
+```
+Direct mTLS (v1.0 — NGINX_MODE=false)
+┌────────┐        mTLS :8443       ┌────────────────────┐
+│ Client │◄────────────────────────┤ FastAPI + stdlib ssl│
+└────────┘                         └────────────────────┘
+
+Nginx termination (v1.1 — NGINX_MODE=true)
+┌────────┐    mTLS :8444    ┌───────┐   plain HTTP   ┌───────────────┐
+│ Client │◄────────────────►│ nginx │◄──────────────►│ FastAPI :8443 │
+└────────┘ (ssl_verify on)  └───────┘ 127.0.0.1 only │  (NGINX_MODE)  │
+                                                     └───────────────┘
+```
+
+| Aspect | Direct mode | Nginx mode |
+|--------|-------------|------------|
+| TLS stack | Python `ssl` module (stdlib) | nginx (OpenSSL 3.x directly) |
+| CN source | `ssl.SSLSocket.getpeercert()` | `X-Client-CN` header (IP-trust + verify + sanitise) |
+| Handshake cost | ~4.5 ms median (T4 PB1) | ~3.9 ms median (N4 NP1) |
+| CRL checking | Python `VERIFY_CRL_CHECK_LEAF` | nginx `ssl_crl` directive |
+| Edge features (rate limit, caching) | None | nginx |
+| Deploy footprint | 1 process | 2 processes |
+| TLS config reload | Process restart | `nginx -s reload` |
+| Security invariants | TLS rejects untrusted at handshake | SI-1..SI-4 (see `docs/nginx_architecture.md`) |
+
+**Switching modes** is a single env var:
+
+```bash
+# Direct (default)
+python server.py
+
+# Behind nginx
+NGINX_MODE=true TRUSTED_PROXY_IPS=127.0.0.1 python server.py
+```
+
+**Nginx quickstart:**
+
+```bash
+make stack          # make pki && make nginx-server
+make test-full      # standard suite + nginx auth suite
+```
+
+`make verify-full` runs every N1..N4 exit criterion and prints a
+pass/fail table — useful before cutting a release.
+
+The single most important invariant in nginx mode is
+**ND1** (see `docs/nginx_auth_test_coverage.md`): FastAPI on
+127.0.0.1:8443 rejects forged `X-Client-CN` headers from callers
+not in `TRUSTED_PROXY_IPS`. If that test stops passing, the
+nginx integration is insecure.
+
 ## Day-2 operations
 
 | Task | How |

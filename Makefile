@@ -52,7 +52,7 @@ endif
 endif
 
 # --- Phony declarations -----------------------------------------------------
-.PHONY: help pki server stop test test-unit test-integration test-cov test-all nginx-check nginx-start nginx-stop nginx-reload nginx-server nginx-stop-all test-nginx bench-nginx stress-nginx load-test-nginx revoke renew pin clean
+.PHONY: help pki server stop test test-unit test-integration test-cov test-all nginx-check nginx-start nginx-stop nginx-reload nginx-server nginx-stop-all test-nginx bench-nginx stress-nginx load-test-nginx test-full stack verify-full revoke renew pin clean
 
 # Default target is `help` so a bare `make` tells you what's available.
 .DEFAULT_GOAL := help
@@ -190,6 +190,35 @@ bench-nginx:  ## N4 — pytest-benchmark handshake-cost suite (NP1..NP4)
 stress-nginx:  ## N4 — concurrency stress (NC1..NC4, slow)
 	$(call INFO,pytest -m slow tests/test_nginx_concurrency.py)
 	@$(PY) -m pytest -m slow tests/test_nginx_concurrency.py
+
+test-full:  ## Run the standard test suite AND the nginx auth suite
+	@$(MAKE) --no-print-directory test
+	@$(MAKE) --no-print-directory test-nginx
+
+stack:  ## Generate PKI and start the full nginx + FastAPI stack
+	@$(MAKE) --no-print-directory pki
+	@$(MAKE) --no-print-directory nginx-server
+
+verify-full:  ## Run every N1..N4 exit criterion, print PASS/FAIL, exit 1 on fail
+	@bash -eu -o pipefail -c '\
+	  fail=0; \
+	  run() { local name="$$1"; shift; \
+	    if eval "$$@" >/dev/null 2>&1; then \
+	      printf "%b[PASS]%b %s\n" "$(C_GREEN)" "$(C_RESET)" "$$name"; \
+	    else \
+	      printf "%b[FAIL]%b %s\n" "$(C_RED)" "$(C_RESET)" "$$name"; \
+	      fail=1; \
+	    fi; \
+	  }; \
+	  run "N1 nginx -t"                   "bash nginx/nginx-test-gen.sh && nginx -t -c $(PWD)/nginx/nginx-test.conf"; \
+	  run "N1 nginx cert is Ed25519"     "openssl x509 -in pki/nginx/nginx.crt -noout -text | grep -q ED25519"; \
+	  run "N1 nginx cert verifies"       "openssl verify -CAfile pki/ca/ca.crt pki/nginx/nginx.crt"; \
+	  run "N1 nginx.key chmod 640"       "[[ \"$$(stat -c %a pki/nginx/nginx.key)\" == 640 ]]"; \
+	  run "N2 middleware unit tests"     "$(PY) -m pytest tests/test_middleware.py -q"; \
+	  run "N3 nginx auth suite"          "$(PY) -m pytest tests/test_nginx_auth.py -q"; \
+	  run "N4 nginx benchmarks"          "$(PY) -m pytest -m performance tests/test_nginx_perf.py -q"; \
+	  run "N4 nginx concurrency"         "$(PY) -m pytest tests/test_nginx_concurrency.py -q"; \
+	  exit $$fail'
 
 load-test-nginx:  ## N4 — Locust load through nginx (60s, 50 users, SLO gate)
 	$(call INFO,locust -f tests/nginx_locustfile.py)
