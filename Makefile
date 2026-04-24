@@ -52,7 +52,7 @@ endif
 endif
 
 # --- Phony declarations -----------------------------------------------------
-.PHONY: help pki server stop test test-unit test-integration test-cov test-all nginx-check nginx-start nginx-stop nginx-reload nginx-server nginx-stop-all revoke renew pin clean
+.PHONY: help pki server stop test test-unit test-integration test-cov test-all nginx-check nginx-start nginx-stop nginx-reload nginx-server nginx-stop-all test-nginx revoke renew pin clean
 
 # Default target is `help` so a bare `make` tells you what's available.
 .DEFAULT_GOAL := help
@@ -176,6 +176,12 @@ nginx-server:  ## Start nginx AND the FastAPI server with NGINX_MODE=true
 nginx-stop-all:  ## Stop both nginx and the FastAPI server
 	@$(MAKE) --no-print-directory nginx-stop
 	@$(MAKE) --no-print-directory stop
+
+test-nginx:  ## Run the N3 nginx auth suite (27 tests across A..F)
+	$(call INFO,pytest tests/test_nginx_auth.py)
+	@$(PY) -m pytest tests/test_nginx_auth.py -v
+	$(call INFO,nginx_auth_matrix.sh)
+	@bash tests/nginx_auth_matrix.sh --quiet
 
 revoke:  ## Revoke client-01 and regenerate the CRL (server restart needed after)
 	$(call INFO,revoking pki/client/client.crt)
