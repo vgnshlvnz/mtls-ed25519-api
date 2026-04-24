@@ -52,6 +52,19 @@ extendedKeyUsage       = clientAuth
 subjectKeyIdentifier   = hash
 authorityKeyIdentifier = keyid, issuer
 
+# --- Nginx termination leaf (N1) --------------------------------------------
+# Nginx listens on :443 as the mTLS terminator. Same chain-of-trust as
+# v3_server; the SAN set covers localhost + 127.0.0.1 + the docker-style
+# "nginx" hostname so internal reverse-proxy configs can refer to it by
+# short name.
+[v3_nginx]
+basicConstraints       = CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = serverAuth
+subjectAltName         = DNS:localhost, IP:127.0.0.1, DNS:nginx
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid, issuer
+
 # --- CA administration (Phase 5 CRL management) -----------------------------
 # Used by `openssl ca -revoke` and `openssl ca -gencrl`. These paths are
 # relative to the project root; any script calling `openssl ca` MUST

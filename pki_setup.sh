@@ -21,6 +21,7 @@ PKI_DIR="${SCRIPT_DIR}/pki"
 CA_DIR="${PKI_DIR}/ca"
 SERVER_DIR="${PKI_DIR}/server"
 CLIENT_DIR="${PKI_DIR}/client"
+NGINX_DIR="${PKI_DIR}/nginx"
 CNF="${PKI_DIR}/openssl.cnf"
 
 CA_KEY="${CA_DIR}/ca.key"
@@ -34,6 +35,12 @@ SRV_CRT="${SERVER_DIR}/server.crt"
 CLI_KEY="${CLIENT_DIR}/client.key"
 CLI_CSR="${CLIENT_DIR}/client.csr"
 CLI_CRT="${CLIENT_DIR}/client.crt"
+
+# N1 — nginx termination cert (same chain-of-trust as the server cert,
+# different SAN set so nginx listens on :443 as "localhost" / "nginx").
+NGX_KEY="${NGINX_DIR}/nginx.key"
+NGX_CSR="${NGINX_DIR}/nginx.csr"
+NGX_CRT="${NGINX_DIR}/nginx.crt"
 
 # Phase-5 CA database state (needed by `openssl ca` for CRL management).
 CA_INDEX="${CA_DIR}/index.txt"
@@ -60,8 +67,20 @@ fail() { printf '%s[FAIL]%s %s\n' "${RED}"   "${NC}" "$*" >&2; exit 1; }
 # --- Preflight --------------------------------------------------------------
 require_openssl() {
     command -v openssl >/dev/null 2>&1 || fail "openssl not found in PATH"
-    local major
-    major="$(openssl version | awk '{print $2}' | cut -d. -f1)"
+    # N1 — hard floor is 1.1.1 (Ed25519 support landed there). Fail with
+    # a clear message rather than letting a later `openssl genpkey -algorithm
+    # ed25519` crash with an obscure error.
+    local version_string major minor patch
+    version_string="$(openssl version | awk '{print $2}')"
+    major="$(echo "${version_string}" | cut -d. -f1)"
+    minor="$(echo "${version_string}" | cut -d. -f2)"
+    patch="$(echo "${version_string}" | cut -d. -f3 | grep -oE '^[0-9]+' || echo 0)"
+    if [[ "${major}" -lt 1 ]] \
+        || { [[ "${major}" -eq 1 ]] && [[ "${minor}" -lt 1 ]]; } \
+        || { [[ "${major}" -eq 1 ]] && [[ "${minor}" -eq 1 ]] && [[ "${patch}" -lt 1 ]]; }
+    then
+        fail "OpenSSL >= 1.1.1 required (found: $(openssl version))"
+    fi
     [[ "${major}" -ge 3 ]] || warn "OpenSSL 3.x recommended (found: $(openssl version))"
 }
 
@@ -77,13 +96,14 @@ esac
 
 require_openssl
 [[ -f "${CNF}" ]] || fail "Missing OpenSSL config: ${CNF}"
-mkdir -p "${CA_DIR}" "${SERVER_DIR}" "${CLIENT_DIR}"
+mkdir -p "${CA_DIR}" "${SERVER_DIR}" "${CLIENT_DIR}" "${NGINX_DIR}"
 
 if [[ ${FORCE} -eq 1 ]]; then
     warn "--force: removing existing keys, CSRs, certs, CRL, and CA database"
     rm -f "${CA_KEY}" "${CA_CRT}" "${CA_SRL}" "${CA_CRL}"
     rm -f "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}"
     rm -f "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}"
+    rm -f "${NGX_KEY}" "${NGX_CSR}" "${NGX_CRT}"
     # server.fingerprint is derived from server.crt and becomes stale the
     # instant we regenerate; pinned_client.py would then fail with a
     # mismatch until `make pin` is re-run. `make clean` already removes it;
@@ -246,13 +266,28 @@ gen_leaf "server" "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}" \
     "/CN=server/O=Lab/C=MY" "v3_server"
 gen_leaf "client" "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}" \
     "/CN=client-01/O=Lab/C=MY" "v3_client"
+gen_leaf "nginx"  "${NGX_KEY}" "${NGX_CSR}" "${NGX_CRT}" \
+    "/CN=nginx/O=Lab/C=MY" "v3_nginx"
+
+# N1 — nginx runs as www-data (group-readable), not root. gen_leaf chmods
+# keys to 600 by default; loosen the nginx key to 640 and change its
+# group so the nginx worker can read it. Skip the chown when www-data is
+# not in /etc/group (e.g. inside a minimal container) — nginx will still
+# start because the file is readable by owner.
+chmod 640 "${NGX_KEY}"
+if getent group www-data >/dev/null 2>&1; then
+    chgrp www-data "${NGX_KEY}" 2>/dev/null || \
+        warn "could not chgrp nginx.key to www-data (non-root)"
+fi
 
 printf '\n'
 verify_chain "server" "${SRV_CRT}"
 verify_chain "client" "${CLI_CRT}"
+verify_chain "nginx"  "${NGX_CRT}"
 
 print_cert_info "CA"     "${CA_CRT}"
 print_cert_info "Server" "${SRV_CRT}"
 print_cert_info "Client" "${CLI_CRT}"
+print_cert_info "Nginx"  "${NGX_CRT}"
 
 printf '\n%s%sPKI setup complete.%s\n' "${BOLD}" "${GREEN}" "${NC}"
