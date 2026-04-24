@@ -52,7 +52,7 @@ endif
 endif
 
 # --- Phony declarations -----------------------------------------------------
-.PHONY: help pki server stop test test-unit test-integration test-cov test-all revoke renew pin clean
+.PHONY: help pki server stop test test-unit test-integration test-cov test-all nginx-check nginx-start nginx-stop nginx-reload nginx-server nginx-stop-all revoke renew pin clean
 
 # Default target is `help` so a bare `make` tells you what's available.
 .DEFAULT_GOAL := help
@@ -144,6 +144,38 @@ test-cov:  ## Run full pytest with coverage (HTML at htmlcov/, threshold in .cov
 test-all:  ## Run unit tests then integration tests (sequential, distinct markers)
 	@$(MAKE) --no-print-directory test-unit
 	@$(MAKE) --no-print-directory test-integration
+
+# --- N1: nginx termination layer --------------------------------------------
+
+NGINX_TEST_CONF := nginx/nginx-test.conf
+
+nginx-check:  ## Regenerate nginx-test.conf and run `nginx -t` on it
+	$(call INFO,nginx-test-gen.sh + nginx -t)
+	@bash nginx/nginx-test-gen.sh
+	@nginx -t -c $(PWD)/$(NGINX_TEST_CONF)
+
+nginx-start:  ## Start nginx with the local test config (foreground-capable)
+	$(call INFO,starting nginx -c $(NGINX_TEST_CONF))
+	@nginx -c $(PWD)/$(NGINX_TEST_CONF)
+
+nginx-stop:  ## Send SIGQUIT to the running nginx (graceful drain)
+	$(call INFO,stopping nginx -s quit)
+	@nginx -c $(PWD)/$(NGINX_TEST_CONF) -s quit 2>/dev/null || \
+		printf '%b[make]%b nginx not running (or already stopped)\n' \
+		"$(C_YELLOW)" "$(C_RESET)"
+
+nginx-reload:  ## Reload nginx config (HUP) after editing nginx.conf
+	$(call INFO,nginx -s reload)
+	@bash nginx/nginx-test-gen.sh
+	@nginx -c $(PWD)/$(NGINX_TEST_CONF) -s reload
+
+nginx-server:  ## Start nginx AND the FastAPI server with NGINX_MODE=true
+	@$(MAKE) --no-print-directory nginx-start
+	@NGINX_MODE=true $(MAKE) --no-print-directory server
+
+nginx-stop-all:  ## Stop both nginx and the FastAPI server
+	@$(MAKE) --no-print-directory nginx-stop
+	@$(MAKE) --no-print-directory stop
 
 revoke:  ## Revoke client-01 and regenerate the CRL (server restart needed after)
 	$(call INFO,revoking pki/client/client.crt)
