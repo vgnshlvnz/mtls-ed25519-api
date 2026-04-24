@@ -40,6 +40,7 @@ import uvicorn
 from fastapi import Body, FastAPI
 from pydantic import BaseModel
 
+from config import NGINX_MODE, TRUSTED_PROXY_IPS
 from middleware import ClientIdentityMiddleware
 from tls import CertAwareH11Protocol, build_server_context
 
@@ -263,7 +264,61 @@ def _refresh_crl() -> None:
 # --- Entrypoint -------------------------------------------------------------
 
 
-def main() -> None:
+def _main_nginx_mode() -> None:
+    """Start uvicorn on plain HTTP — nginx terminates mTLS on :443.
+
+    SECURITY (SI-4): refuse to start if TRUSTED_PROXY_IPS is empty.
+    The middleware's IP check would pass for nothing, so every
+    request would be denied at the authz layer — harmless, but
+    also useless. More importantly it signals operator error:
+    NGINX_MODE=true without any trusted proxy IP configured means
+    no one will ever get through. Fail closed with exit 2.
+    """
+    if not TRUSTED_PROXY_IPS:
+        logger.critical(
+            "NGINX_MODE=true refused to start — TRUSTED_PROXY_IPS is empty. "
+            "Set TRUSTED_PROXY_IPS=127.0.0.1 (or your nginx source IPs)."
+        )
+        sys.exit(2)
+
+    # Warn if the caller left TLS cert paths around — they will be
+    # silently ignored now. Not fatal, but worth surfacing because
+    # a half-done migration is a common mistake.
+    if SERVER_CERT.is_file() or SERVER_KEY.is_file():
+        logger.warning(
+            "nginx_mode_cert_paths_ignored server_cert_exists=%s server_key_exists=%s",
+            SERVER_CERT.is_file(),
+            SERVER_KEY.is_file(),
+        )
+
+    logger.info(
+        "server_started mode=nginx_proxy bind=%s:%d tls=terminated_by_nginx "
+        "trusted_proxy_ips=%s",
+        BIND_HOST,
+        BIND_PORT,
+        ",".join(sorted(TRUSTED_PROXY_IPS)),
+    )
+
+    config = uvicorn.Config(
+        app=app,
+        host=BIND_HOST,
+        port=BIND_PORT,
+        loop="asyncio",
+        log_config=None,
+        access_log=False,
+        lifespan="off",
+    )
+    server = uvicorn.Server(config)
+    with asyncio.Runner(loop_factory=config.get_loop_factory()) as runner:
+        runner.run(server.serve())
+
+
+def _main_direct_mode() -> None:
+    """Start uvicorn with the project's audited SSLContext (v1.0 path).
+
+    No behaviour change — this is the body that used to live inline
+    in ``main()``, extracted so ``NGINX_MODE`` can branch at the top.
+    """
     # Regenerate the CRL before building the SSLContext, so the loaded
     # CRL has a fresh nextUpdate. See _refresh_crl docstring for why
     # this matters — without it the service dies after 7 days.
@@ -282,7 +337,11 @@ def main() -> None:
         tls_ctx.minimum_version.name,
         len(tls_ctx.get_ciphers()),
     )
-    logger.info("binding https://%s:%d (mTLS: required)", BIND_HOST, BIND_PORT)
+    logger.info(
+        "server_started mode=direct bind=https://%s:%d tls=required",
+        BIND_HOST,
+        BIND_PORT,
+    )
 
     config = uvicorn.Config(
         app=app,
@@ -320,6 +379,13 @@ def main() -> None:
     # when available; falls back to stdlib asyncio otherwise.
     with asyncio.Runner(loop_factory=config.get_loop_factory()) as runner:
         runner.run(server.serve())
+
+
+def main() -> None:
+    if NGINX_MODE:
+        _main_nginx_mode()
+    else:
+        _main_direct_mode()
 
 
 if __name__ == "__main__":
