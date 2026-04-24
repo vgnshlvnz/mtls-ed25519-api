@@ -58,6 +58,7 @@ endif
 
 # --- Phony declarations -----------------------------------------------------
 .PHONY: help pki server stop test test-unit test-integration test-cov test-all \
+        test-apache \
         revoke renew pin clean \
         nginx-config nginx-start nginx-stop nginx-reload stack \
         apache-check apache-start apache-stop apache-reload apache-server \
@@ -250,6 +251,10 @@ test-cov:  ## Run full pytest with coverage (HTML at htmlcov/)
 test-all:  ## Run unit tests then integration tests (sequential, distinct markers)
 	@$(MAKE) --no-print-directory test-unit
 	@$(MAKE) --no-print-directory test-integration
+
+test-apache:  ## Run the Apache auth pytest suite (v1.3, 27 tests)
+	$(call INFO,pytest tests/test_apache_auth.py)
+	@$(PY) -m pytest tests/test_apache_auth.py -v
 
 revoke:  ## Revoke client-01 and regenerate the CRL (nginx reload needed after)
 	$(call INFO,revoking pki/client/client.crt)
