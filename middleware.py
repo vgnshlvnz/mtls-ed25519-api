@@ -4,16 +4,36 @@ One middleware class combines two responsibilities:
 
 1. Request-context tagging — assign (or honour) an X-Request-ID, stamp
    every response with it, emit structured start/end log lines.
-2. Identity enforcement — extract the peer cert's Subject CommonName and
-   check it against ALLOWED_CLIENT_CNS; short-circuit non-admitted
-   requests to 403 before any route handler runs.
+2. Identity enforcement — extract the client CN (from the TLS peer
+   cert or from nginx-forwarded headers, per NGINX_MODE) and check it
+   against ALLOWED_CLIENT_CNS; short-circuit non-admitted requests
+   to 403 before any route handler runs.
 
 Layering note
 -------------
-By the time this middleware runs, the TLS handshake has already succeeded:
-the ssl module rejected "no cert presented" and "cert signed by unknown
-CA" at the handshake. This middleware adds an *additional* identity-based
-check on top of that TLS verification.
+In the v1.0 direct-mTLS path the TLS handshake has already succeeded by
+the time this middleware runs — the ssl module rejected "no cert
+presented" and "cert signed by unknown CA" at the handshake. This
+middleware adds an *additional* identity-based check on top.
+
+In the v1.1 NGINX_MODE path, TLS terminates at nginx and the peer-cert
+fields arrive as HTTP headers. The four invariants below keep that
+channel from becoming a bypass:
+
+Security invariants (N2)
+------------------------
+SI-1: X-Client-CN is trusted ONLY when ``request.client.host`` is in
+      ``config.TRUSTED_PROXY_IPS``. Anyone reaching FastAPI's plain-HTTP
+      port directly with a forged header is denied at the IP gate.
+SI-2: ``X-Client-Verify`` must be the literal string ``"SUCCESS"`` —
+      defence-in-depth beyond the IP check. Covers the case where
+      nginx proxies even when its own ssl_verify_client failed.
+SI-3: CN sanitisation rejects embedded CR / LF / NUL and strips
+      surrounding whitespace, preventing log-injection forgery of a
+      second log line.
+SI-4: In NGINX_MODE with empty ``TRUSTED_PROXY_IPS``, the server
+      refuses to start (``sys.exit(2)`` in ``server.main``). See
+      ``server._main_nginx_mode``.
 
 Logging discipline
 ------------------
@@ -34,7 +54,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from config import ALLOWED_CLIENT_CNS
+from config import ALLOWED_CLIENT_CNS, NGINX_MODE, TRUSTED_PROXY_IPS
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +62,7 @@ logger = logging.getLogger(__name__)
 # --- Cert inspection helpers ------------------------------------------------
 
 
-def extract_cn(peer_cert: dict[str, Any] | None) -> str | None:
+def extract_cn_from_cert(peer_cert: dict[str, Any] | None) -> str | None:
     """Return the Subject CommonName from a stdlib-format peer cert dict.
 
     Accepts the nested-tuple structure produced by
@@ -66,6 +86,88 @@ def extract_cn(peer_cert: dict[str, Any] | None) -> str | None:
             # Malformed RDN — fail closed by skipping, keep scanning.
             continue
     return None
+
+
+def extract_cn_from_headers(request: Request) -> str | None:
+    """Return the CN forwarded by a trusted nginx proxy, or None.
+
+    NGINX_MODE counterpart to ``extract_cn_from_cert``. Used when
+    nginx terminates mTLS on :443 and forwards the peer-cert fields
+    as HTTP headers to FastAPI on 127.0.0.1:8443 (plain HTTP).
+
+    SECURITY (SI-1): the ``X-Client-CN`` header is trusted ONLY when
+    the request's source IP is in ``config.TRUSTED_PROXY_IPS``. Any
+    caller reaching this port directly from a non-proxy IP could
+    otherwise forge the header and bypass auth entirely.
+
+    Returns None if the IP check fails, the header is absent, or
+    anything is off. The caller treats a None return as "no valid
+    client identity" and responds with 403.
+    """
+    client_ip = request.client.host if request.client else "-"
+    if client_ip not in TRUSTED_PROXY_IPS:
+        logger.warning(
+            "untrusted_proxy_cn_header_blocked mode=nginx client_ip=%s",
+            client_ip,
+        )
+        return None
+
+    # SECURITY (SI-2): nginx sets X-Client-Verify to the string
+    # ``SUCCESS`` only when ssl_verify_client succeeded — it will be
+    # ``NONE`` / ``FAILED:<reason>`` otherwise. A defence-in-depth
+    # belt-and-braces check beyond the IP trust gate: if nginx
+    # forwarded the request but marks verification as failed, we
+    # refuse to honour the CN.
+    verify = request.headers.get("X-Client-Verify", "")
+    if verify != "SUCCESS":
+        logger.warning(
+            "nginx_cert_verify_not_success mode=nginx value=%r client_ip=%s",
+            verify,
+            client_ip,
+        )
+        return None
+
+    raw_cn = request.headers.get("X-Client-CN")
+    if raw_cn is None:
+        return None
+
+    # SECURITY (SI-3): even though the IP trust gate keeps most
+    # adversaries out, a bug in nginx's sanitisation or a future
+    # config mistake could put a forged CN into this path. Reject
+    # anything that could forge a second log line or truncate
+    # downstream: embedded newlines, carriage returns, or NUL
+    # bytes. Whitespace is stripped; the resulting empty string
+    # is also a reject (empty CN is meaningless for the allowlist).
+    cn = raw_cn.strip()
+    if not cn or "\n" in cn or "\r" in cn or "\x00" in cn:
+        logger.warning(
+            "cn_sanitisation_failed mode=nginx reason=%s client_ip=%s",
+            "empty" if not cn else "control_char",
+            client_ip,
+        )
+        return None
+
+    return cn
+
+
+def resolve_client_cn(
+    request: Request,
+    peer_cert: dict[str, Any] | None,
+) -> str | None:
+    """Dispatch to the right CN extractor based on ``NGINX_MODE``.
+
+    - ``NGINX_MODE=true``  → trust nginx-forwarded headers (gated by
+       IP / X-Client-Verify / sanitisation in ``extract_cn_from_headers``).
+    - ``NGINX_MODE=false`` → parse the cert dict handed up by the
+       stdlib ``ssl`` module (the v1.0 direct-mTLS path).
+
+    Module-level constant ``NGINX_MODE`` is read from the config
+    module — tests monkeypatch ``middleware.NGINX_MODE`` directly to
+    exercise both branches.
+    """
+    if NGINX_MODE:
+        return extract_cn_from_headers(request)
+    return extract_cn_from_cert(peer_cert)
 
 
 def subject_fingerprint(peer_cert: dict[str, Any] | None) -> str:
@@ -114,7 +216,7 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
         peer_cert: dict[str, Any] | None = (
             request.scope.get("extensions", {}).get("tls", {}).get("peer_cert")
         )
-        client_cn = extract_cn(peer_cert)
+        client_cn = resolve_client_cn(request, peer_cert)
         fingerprint = subject_fingerprint(peer_cert)
         peer_addr = request.client.host if request.client else "-"
 
@@ -182,6 +284,8 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
 
 __all__ = [
     "ClientIdentityMiddleware",
-    "extract_cn",
+    "extract_cn_from_cert",
+    "extract_cn_from_headers",
+    "resolve_client_cn",
     "subject_fingerprint",
 ]
