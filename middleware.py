@@ -92,6 +92,21 @@ def extract_cn_from_headers(request: Request) -> str | None:
         )
         return None
 
+    # SECURITY (SI-2): nginx sets X-Client-Verify to the string
+    # ``SUCCESS`` only when ssl_verify_client succeeded — it will be
+    # ``NONE`` / ``FAILED:<reason>`` otherwise. A defence-in-depth
+    # belt-and-braces check beyond the IP trust gate: if nginx
+    # forwarded the request but marks verification as failed, we
+    # refuse to honour the CN.
+    verify = request.headers.get("X-Client-Verify", "")
+    if verify != "SUCCESS":
+        logger.warning(
+            "nginx_cert_verify_not_success mode=nginx value=%r client_ip=%s",
+            verify,
+            client_ip,
+        )
+        return None
+
     return request.headers.get("X-Client-CN") or None
 
 
