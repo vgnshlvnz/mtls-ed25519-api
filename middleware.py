@@ -4,16 +4,36 @@ One middleware class combines two responsibilities:
 
 1. Request-context tagging — assign (or honour) an X-Request-ID, stamp
    every response with it, emit structured start/end log lines.
-2. Identity enforcement — extract the peer cert's Subject CommonName and
-   check it against ALLOWED_CLIENT_CNS; short-circuit non-admitted
-   requests to 403 before any route handler runs.
+2. Identity enforcement — extract the client CN (from the TLS peer
+   cert or from nginx-forwarded headers, per NGINX_MODE) and check it
+   against ALLOWED_CLIENT_CNS; short-circuit non-admitted requests
+   to 403 before any route handler runs.
 
 Layering note
 -------------
-By the time this middleware runs, the TLS handshake has already succeeded:
-the ssl module rejected "no cert presented" and "cert signed by unknown
-CA" at the handshake. This middleware adds an *additional* identity-based
-check on top of that TLS verification.
+In the v1.0 direct-mTLS path the TLS handshake has already succeeded by
+the time this middleware runs — the ssl module rejected "no cert
+presented" and "cert signed by unknown CA" at the handshake. This
+middleware adds an *additional* identity-based check on top.
+
+In the v1.1 NGINX_MODE path, TLS terminates at nginx and the peer-cert
+fields arrive as HTTP headers. The four invariants below keep that
+channel from becoming a bypass:
+
+Security invariants (N2)
+------------------------
+SI-1: X-Client-CN is trusted ONLY when ``request.client.host`` is in
+      ``config.TRUSTED_PROXY_IPS``. Anyone reaching FastAPI's plain-HTTP
+      port directly with a forged header is denied at the IP gate.
+SI-2: ``X-Client-Verify`` must be the literal string ``"SUCCESS"`` —
+      defence-in-depth beyond the IP check. Covers the case where
+      nginx proxies even when its own ssl_verify_client failed.
+SI-3: CN sanitisation rejects embedded CR / LF / NUL and strips
+      surrounding whitespace, preventing log-injection forgery of a
+      second log line.
+SI-4: In NGINX_MODE with empty ``TRUSTED_PROXY_IPS``, the server
+      refuses to start (``sys.exit(2)`` in ``server.main``). See
+      ``server._main_nginx_mode``.
 
 Logging discipline
 ------------------
