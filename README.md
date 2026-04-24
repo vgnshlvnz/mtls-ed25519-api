@@ -68,6 +68,43 @@ independent commits on top — `git log --oneline` reads as a progression.
 * Cert pinning (`pinned_client.py`) hashes the raw DER bytes — never the
   parsed `getpeercert()` dict, which is a lossy representation.
 
+## Running the test suite
+
+The Python test surface is driven by **pytest** with two primary
+layers, selectable by marker:
+
+| Marker | What runs | Typical time |
+|--------|-----------|--------------|
+| `unit` | Pure-function tests in `tests/test_middleware.py`. No sockets, no subprocess. | < 1s |
+| `integration` | Starts a real `server.py` subprocess behind mTLS (session-scoped fixture) and hits every endpoint with `requests.Session` and `httpx.AsyncClient`. | ~5s cold |
+
+Common invocations (all via the Makefile, or `pytest` directly):
+
+```bash
+make test-unit            # fast unit layer
+make test-integration     # live server + real mTLS
+make test-all             # both, sequentially
+make test-cov             # full pytest with branch coverage (fail_under=70)
+make test                 # pytest + legacy curl matrix + negative tests
+```
+
+Additional markers — `slow`, `security`, `performance`, `e2e` — are
+registered in `pytest.ini` and populated by later test-expansion phases
+(T2 onward). Run a single marker with `pytest -m <marker>`; combine
+markers with boolean expressions (`pytest -m "unit and not slow"`).
+
+Coverage is configured in `.coveragerc`:
+
+* Scope: `server.py`, `middleware.py`, `tls.py`, `config.py` (the
+  server-side surface).
+* Branch coverage enabled; the T1 baseline floor is **70%**.
+  Each subsequent phase must hold or raise it.
+* HTML report at `htmlcov/index.html` after `make test-cov`.
+
+Server fixture behaviour — the integration suite will pick a random
+free loopback port via `MTLS_API_PORT` when 8443 is already bound,
+so tests are safe to run alongside a backgrounded `make server`.
+
 ## Day-2 operations
 
 | Task | How |
