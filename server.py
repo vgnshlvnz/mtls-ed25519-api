@@ -1,16 +1,17 @@
 """mTLS REST API — v1.2 plain-FastAPI entrypoint.
 
-Binds ``127.0.0.1:8443`` as **plain HTTP**. All authentication and
-authorization happens upstream at nginx (see ``nginx/nginx.conf`` —
-mTLS handshake, CRL check, and CN allowlist all live there). By the
-time a request reaches this process, nginx has already decided the
-caller is allowed to talk to us.
+Binds 127.0.0.1:8443 as plain HTTP. All authentication and
+authorization happens upstream at nginx (see nginx/nginx.conf —
+mutual-TLS handshake, revocation check, and CN allowlist all live
+there). By the time a request reaches this process, nginx has
+already decided the caller is allowed to talk to us.
 
-Architectural invariant (v1.2): FastAPI is auth-blind. Do NOT
-reintroduce ``ssl.SSLContext``, ``CERT_REQUIRED``, cert parsing, or an
-application-layer CN check here — those belonged to the v1.0/v1.1
-architectures and have been deliberately ripped out. The structural
-test suite (``tests/test_v12_structural.py``) enforces this at CI time.
+Architectural invariant (v1.2): FastAPI is auth-blind. Do not
+reintroduce TLS-context construction, peer-cert parsing, or an
+application-layer CN check in this module — those belonged to the
+v1.0/v1.1 architectures and have been deliberately ripped out. The
+structural test suite (tests/test_v12_structural.py) enforces this
+at CI time, including literal grep against forbidden symbol names.
 
 Endpoints (no auth logic — nginx already decided):
     GET  /health   liveness probe

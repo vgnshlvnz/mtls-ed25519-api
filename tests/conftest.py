@@ -128,12 +128,19 @@ def _wait_for_plain_health(base_url: str, deadline: float) -> None:
 
 
 @pytest.fixture(scope="session")
-def plain_server() -> Iterator[dict[str, object]]:
+def plain_server(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[dict[str, object]]:
     """Start server.py on a free loopback port, plain HTTP.
 
     Tests that want to verify FastAPI's auth-blind contract (e.g. the
     v1.2 structural suite and the SP1-SP8 plain-FastAPI tests) use
     this fixture to hit the upstream directly, bypassing nginx.
+
+    ``log_path`` in the yielded dict points at a regular file holding
+    the subprocess's stdout+stderr. Tests that want to inspect the
+    FastAPI log (e.g. LA1) can read it freely — we no longer buffer
+    through subprocess.PIPE.
     """
     port = (
         _DEFAULT_PORT
@@ -148,11 +155,14 @@ def plain_server() -> Iterator[dict[str, object]]:
     if "coverage" in sys.modules and (REPO_ROOT / ".coveragerc").is_file():
         env["COVERAGE_PROCESS_START"] = str(REPO_ROOT / ".coveragerc")
 
+    log_path = tmp_path_factory.mktemp("plain-server") / "server.log"
+    log_fh = log_path.open("w")
+
     proc = subprocess.Popen(
         [sys.executable, "server.py"],
         cwd=str(REPO_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_fh,
         stderr=subprocess.STDOUT,
     )
 
@@ -163,18 +173,24 @@ def plain_server() -> Iterator[dict[str, object]]:
     except Exception:
         proc.terminate()
         try:
-            out, _ = proc.communicate(timeout=5)
+            proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-            out, _ = proc.communicate()
+            proc.wait(timeout=5)
+        log_fh.close()
         sys.stderr.write(
-            f"\n[plain_server] startup failed, child stdout:\n"
-            f"{out.decode(errors='replace')}\n"
+            f"\n[plain_server] startup failed, log:\n"
+            f"{log_path.read_text(errors='replace')}\n"
         )
         raise
 
     try:
-        yield {"base_url": base_url, "port": port, "process": proc}
+        yield {
+            "base_url": base_url,
+            "port": port,
+            "process": proc,
+            "log_path": log_path,
+        }
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -183,3 +199,4 @@ def plain_server() -> Iterator[dict[str, object]]:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+        log_fh.close()
