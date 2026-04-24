@@ -1,0 +1,24 @@
+# Repository code owners — reviews required for matching paths.
+#
+# Ordering matters: the LAST matching entry wins.
+
+# Default — anything not matched below.
+*                               @vgnshlvnz
+
+# Security-sensitive surface requires explicit review.
+/server.py                      @vgnshlvnz
+/middleware.py                  @vgnshlvnz
+/tls.py                         @vgnshlvnz
+/config.py                      @vgnshlvnz
+/pinned_client.py               @vgnshlvnz
+/pki_setup.sh                   @vgnshlvnz
+/pki/openssl.cnf                @vgnshlvnz
+/logging_config.py              @vgnshlvnz
+
+# CI / release plumbing.
+/.github/                       @vgnshlvnz
+/.pre-commit-config.yaml        @vgnshlvnz
+
+# Test-suite infrastructure (fixtures shared across all test files).
+/tests/conftest.py              @vgnshlvnz
+/tests/_pki_factory.py          @vgnshlvnz

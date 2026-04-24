@@ -1,0 +1,299 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, 'feature/**']
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  # Cancel in-flight PR builds on new pushes; keep main/develop builds.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: write   # coverage-gate posts a PR comment
+
+jobs:
+
+  # --- Job 1: lint ---------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install ruff + pre-commit
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.4.2 pre-commit shellcheck-py
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: shellcheck
+        run: |
+          find . -name '*.sh' -not -path './venv/*' -not -path './.git/*' \
+            -exec shellcheck {} +
+      - name: pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  # --- Job 2: pki-smoke ----------------------------------------------------
+  pki-smoke:
+    name: PKI smoke
+    needs: lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Cache pki/
+        id: pki-cache
+        uses: actions/cache@v4
+        with:
+          path: pki
+          key: pki-${{ hashFiles('pki_setup.sh', 'pki/openssl.cnf') }}
+      - name: Generate PKI (only on cache miss)
+        if: steps.pki-cache.outputs.cache-hit != 'true'
+        run: ./pki_setup.sh
+      - name: Verify chain
+        run: |
+          openssl verify -CAfile pki/ca/ca.crt pki/server/server.crt
+          openssl verify -CAfile pki/ca/ca.crt pki/client/client.crt
+      - name: Assert Ed25519
+        run: |
+          for cert in pki/ca/ca.crt pki/server/server.crt pki/client/client.crt; do
+            openssl x509 -in "$cert" -noout -text | \
+              grep -q 'Public Key Algorithm: ED25519' || \
+              { echo "FAIL: $cert is not Ed25519"; exit 1; }
+          done
+      - name: Assert no .key in git history
+        run: |
+          if git log --all --full-history -- '*.key' | grep -q commit; then
+            echo "FAIL: .key files found in git history"
+            exit 1
+          fi
+
+  # --- Job 3: unit-tests ---------------------------------------------------
+  unit-tests:
+    name: Unit tests
+    needs: lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run unit tests
+        run: |
+          pytest -m unit \
+            --cov=server --cov=middleware --cov=tls --cov=config \
+            --cov-report=xml:coverage-unit.xml \
+            --junitxml=junit-unit.xml \
+            -n auto
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage-unit.xml
+      - name: Upload JUnit
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-unit
+          path: junit-unit.xml
+
+  # --- Job 4: integration-tests -------------------------------------------
+  integration-tests:
+    name: Integration tests (${{ matrix.os }})
+    needs: pki-smoke
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-20.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore pki/ cache
+        uses: actions/cache@v4
+        with:
+          path: pki
+          key: pki-${{ hashFiles('pki_setup.sh', 'pki/openssl.cnf') }}
+      - name: Regenerate PKI if cache miss
+        run: |
+          if [ ! -f pki/ca/ca.crt ]; then ./pki_setup.sh; fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run integration tests
+        run: |
+          pytest -m "integration and not slow" --timeout=60 \
+            --cov=server --cov=middleware --cov=tls --cov=config \
+            --cov-report=xml:coverage-int-${{ matrix.os }}.xml
+      - name: Legacy shell test matrices
+        run: |
+          # Start server for curl_tests.sh / negative_tests.sh
+          python server.py > /tmp/srv.log 2>&1 &
+          SRV=$!
+          for _ in $(seq 1 15); do
+            curl -sf --cacert pki/ca/ca.crt --cert pki/client/client.crt \
+              --key pki/client/client.key https://127.0.0.1:8443/health \
+              >/dev/null && break
+            sleep 1
+          done
+          bash tests/curl_tests.sh
+          bash tests/negative_tests.sh
+          kill $SRV 2>/dev/null || true
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-integration-${{ matrix.os }}
+          path: coverage-int-${{ matrix.os }}.xml
+
+  # --- Job 5: security-tests ----------------------------------------------
+  security-tests:
+    name: Security tests
+    needs: integration-tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore pki/ cache
+        uses: actions/cache@v4
+        with:
+          path: pki
+          key: pki-${{ hashFiles('pki_setup.sh', 'pki/openssl.cnf') }}
+      - name: Regenerate PKI if cache miss
+        run: |
+          if [ ! -f pki/ca/ca.crt ]; then ./pki_setup.sh; fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run security suite
+        run: |
+          pytest -m security --timeout=120
+      - name: TLS attack matrix
+        run: bash tests/tls_attack_matrix.sh --quiet
+
+  # --- Job 6: coverage-gate -----------------------------------------------
+  coverage-gate:
+    name: Coverage gate
+    needs: [unit-tests, integration-tests]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install coverage
+        run: pip install coverage
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+      - name: Combine + enforce 85% gate
+        run: |
+          # Re-parse the XML coverage artifacts via coverage.py's
+          # report — the artifacts are already in Cobertura format,
+          # so we just enforce the numeric gate.
+          python - <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+          total = 0.0
+          count = 0
+          for path in glob.glob("coverage-*.xml"):
+              tree = ET.parse(path)
+              rate = float(tree.getroot().attrib.get("line-rate", "0"))
+              total += rate
+              count += 1
+              print(f"{path}: {rate * 100:.1f}%")
+          if count == 0:
+              print("no coverage artifacts found")
+              sys.exit(1)
+          avg = (total / count) * 100
+          print(f"combined: {avg:.1f}%")
+          if avg < 85.0:
+              print(f"FAIL: combined coverage {avg:.1f}% < 85% gate")
+              sys.exit(1)
+          PY
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ Coverage gate (85%) passed. See CI artifacts for full report.'
+            })
+
+  # --- Job 7: performance-regression --------------------------------------
+  performance-regression:
+    name: Performance regression
+    needs: integration-tests
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restore pki/ cache
+        uses: actions/cache@v4
+        with:
+          path: pki
+          key: pki-${{ hashFiles('pki_setup.sh', 'pki/openssl.cnf') }}
+      - name: Regenerate PKI if cache miss
+        run: |
+          if [ ! -f pki/ca/ca.crt ]; then ./pki_setup.sh; fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Benchmark vs stored baseline
+        run: |
+          if compgen -G ".benchmarks/*/0001_*.json" > /dev/null; then
+            pytest -m performance \
+              --benchmark-compare=0001 \
+              --benchmark-compare-fail=median:20%
+          else
+            echo "No baseline under .benchmarks/; recording one."
+            pytest -m performance --benchmark-autosave
+          fi
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: .benchmarks/
