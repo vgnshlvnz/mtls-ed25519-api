@@ -52,7 +52,7 @@ endif
 endif
 
 # --- Phony declarations -----------------------------------------------------
-.PHONY: help pki server stop test test-unit test-integration test-cov test-all nginx-check nginx-start nginx-stop nginx-reload nginx-server nginx-stop-all test-nginx revoke renew pin clean
+.PHONY: help pki server stop test test-unit test-integration test-cov test-all nginx-check nginx-start nginx-stop nginx-reload nginx-server nginx-stop-all test-nginx bench-nginx stress-nginx load-test-nginx revoke renew pin clean
 
 # Default target is `help` so a bare `make` tells you what's available.
 .DEFAULT_GOAL := help
@@ -182,6 +182,21 @@ test-nginx:  ## Run the N3 nginx auth suite (27 tests across A..F)
 	@$(PY) -m pytest tests/test_nginx_auth.py -v
 	$(call INFO,nginx_auth_matrix.sh)
 	@bash tests/nginx_auth_matrix.sh --quiet
+
+bench-nginx:  ## N4 — pytest-benchmark handshake-cost suite (NP1..NP4)
+	$(call INFO,pytest -m performance tests/test_nginx_perf.py)
+	@$(PY) -m pytest -m performance tests/test_nginx_perf.py
+
+stress-nginx:  ## N4 — concurrency stress (NC1..NC4, slow)
+	$(call INFO,pytest -m slow tests/test_nginx_concurrency.py)
+	@$(PY) -m pytest -m slow tests/test_nginx_concurrency.py
+
+load-test-nginx:  ## N4 — Locust load through nginx (60s, 50 users, SLO gate)
+	$(call INFO,locust -f tests/nginx_locustfile.py)
+	@$(VENV)/bin/locust -f tests/nginx_locustfile.py --headless \
+		-u 50 --spawn-rate 10 --run-time 60s \
+		--host https://localhost:8444 --exit-code-on-error 1
+	$(call INFO,load test passed — see stdout for p95/p99)
 
 revoke:  ## Revoke client-01 and regenerate the CRL (server restart needed after)
 	$(call INFO,revoking pki/client/client.crt)
