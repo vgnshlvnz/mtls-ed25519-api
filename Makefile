@@ -58,7 +58,7 @@ endif
 
 # --- Phony declarations -----------------------------------------------------
 .PHONY: help pki server stop test test-unit test-integration test-cov test-all \
-        test-apache \
+        test-apache bench-apache load-test-apache \
         revoke renew pin clean \
         nginx-config nginx-start nginx-stop nginx-reload stack \
         apache-check apache-start apache-stop apache-reload apache-server \
@@ -255,6 +255,18 @@ test-all:  ## Run unit tests then integration tests (sequential, distinct marker
 test-apache:  ## Run the Apache auth pytest suite (v1.3, 27 tests)
 	$(call INFO,pytest tests/test_apache_auth.py)
 	@$(PY) -m pytest tests/test_apache_auth.py -v
+
+bench-apache:  ## Run AP1-AP4 benchmarks against Apache
+	$(call INFO,pytest tests/test_apache_perf.py -m performance)
+	@$(PY) -m pytest tests/test_apache_perf.py -m performance -v
+
+load-test-apache:  ## Headless Locust load run against Apache (60s, 50 users)
+	$(call INFO,locust against https://localhost:8445)
+	@$(VENV)/bin/locust \
+	    --locustfile tests/apache_locustfile.py \
+	    --host https://localhost:8445 \
+	    --users 50 --spawn-rate 10 --run-time 60s \
+	    --headless --exit-code-on-error 1
 
 revoke:  ## Revoke client-01 and regenerate the CRL (nginx reload needed after)
 	$(call INFO,revoking pki/client/client.crt)
