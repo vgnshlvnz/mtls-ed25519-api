@@ -1,0 +1,156 @@
+name: Nginx CI (v1.2)
+
+# CI for the v1.2 architecture: nginx-only authentication, auth-blind
+# FastAPI. Three jobs, staged so fast checks fail first:
+#
+#   1. structural-check — ST1-ST3 + LA1-style grep. Inspects source
+#      only; no PKI/nginx needed. Runs in seconds.
+#   2. nginx-config-lint — generates the test config with `make
+#      nginx-config`, asserts v1.2-specific directives are present.
+#   3. nginx-auth-tests — full 42-test pytest run against a real
+#      FastAPI + nginx stack.
+#
+# The v1.1-era "ND1 CRITICAL — Header Injection Defence" step is
+# intentionally gone. In v1.2 there is no middleware to bypass —
+# FastAPI doesn't read X-Client-* headers, so there's no injection
+# vector to gate. ST3 enforces this at build time.
+
+on:
+  push:
+    branches: [main, develop, 'feature/nginx-**']
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: nginx-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+
+  # --- Job 1: structural-check (source-only, no deps) -----------------------
+  structural-check:
+    name: v1.2 structural invariant
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install Python deps (pytest only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run ST1-ST3 structural tests
+        # These tests inspect source code — no PKI, no nginx, no
+        # FastAPI subprocess. They catch the "someone reintroduced
+        # FastAPI-side auth" regression before the more expensive
+        # integration jobs even start.
+        run: pytest tests/test_v12_structural.py -v --tb=short
+
+      - name: Assert deleted modules stay deleted
+        # Belt-and-braces extra check: ST1 already asserts this via
+        # Python, but a shell-level check in CI adds a second layer
+        # that doesn't depend on pytest collecting the file.
+        run: |
+          set -e
+          for f in middleware.py tls.py; do
+            if [ -e "$f" ]; then
+              echo "FAIL: $f exists — v1.2 requires this module deleted."
+              exit 1
+            fi
+          done
+          echo "PASS: middleware.py and tls.py remain deleted"
+
+  # --- Job 2: nginx-config-lint --------------------------------------------
+  nginx-config-lint:
+    name: Nginx config lint (v1.2)
+    needs: structural-check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nginx + openssl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends nginx openssl
+
+      - name: Generate PKI (needed for nginx -t to read ca.crt / nginx.crt)
+        run: ./pki_setup.sh --force
+
+      - name: Generate nginx-test.conf + run nginx -t
+        run: make nginx-config
+
+      - name: Assert v1.2 required directives are present
+        # Beyond nginx -t's syntax check, verify the *semantic* shape
+        # of the v1.2 config: the allowlist map{} block and the
+        # if ($cn_allowed = 0) deny branch must both be there, along
+        # with the TLS + CRL + server_tokens baseline.
+        run: |
+          set -e
+          for d in ssl_verify_client ssl_crl server_tokens; do
+            if ! grep -q "$d" nginx/nginx.conf; then
+              echo "FAIL: $d directive missing from nginx/nginx.conf"
+              exit 1
+            fi
+          done
+          if ! grep -q 'map \$ssl_client_cn \$cn_allowed' nginx/nginx.conf; then
+            echo 'FAIL: v1.2 allowlist map{} block missing'
+            exit 1
+          fi
+          if ! grep -q 'if (\$cn_allowed = 0)' nginx/nginx.conf; then
+            echo 'FAIL: v1.2 deny branch missing from location /'
+            exit 1
+          fi
+          echo "PASS: v1.2 nginx.conf contains map{} allowlist + deny branch"
+
+  # --- Job 3: nginx-auth-tests --------------------------------------------
+  nginx-auth-tests:
+    name: Nginx auth tests (42 tests)
+    needs: nginx-config-lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install nginx + openssl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends nginx openssl
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Generate PKI
+        run: ./pki_setup.sh --force
+
+      - name: Verify PKI chain (CA, server, nginx, client)
+        run: |
+          openssl verify -CAfile pki/ca/ca.crt pki/server/server.crt
+          openssl verify -CAfile pki/ca/ca.crt pki/nginx/nginx.crt
+          openssl verify -CAfile pki/ca/ca.crt pki/client/client.crt
+
+      - name: Run the full v1.2 pytest suite
+        # Includes: N2v2 (22 auth + NC5 = 23), N3v2 (ST1-ST3 + SP1-SP8 + LA1 = 13),
+        # N4v2 (NP1-NP3 + NC1-NC3 = 6). Total: 42 tests. The
+        # structural-check job already ran the unit ST tests in
+        # isolation; running them again here keeps the pytest count
+        # unchanged and catches any conftest-level regressions.
+        run: pytest tests/ -v --timeout=90
