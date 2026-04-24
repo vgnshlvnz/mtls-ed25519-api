@@ -48,3 +48,11 @@ htmlcov/
 nginx/nginx-test.conf
 nginx/logs/
 .nginx.log
+
+# Apache v1.3 runtime — generated from apache/apache.conf by apache-test-gen.sh
+apache/apache-test.conf
+apache/logs/
+.apache.log
+
+# Apache cert pinning fingerprint (regenerable via `make pin-apache`)
+pki/apache/apache.fingerprint
