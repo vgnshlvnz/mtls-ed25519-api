@@ -99,10 +99,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Run unit tests
+        # --cov-fail-under=0 disables the per-job gate; only the
+        # unit-tested helpers (middleware, config) run here, so
+        # measuring against server.py / tls.py produces a 50-60%
+        # number that is expected. The combined gate (85%) is
+        # enforced on the merged artifacts in the coverage-gate
+        # job downstream.
         run: |
           pytest -m unit \
             --cov=server --cov=middleware --cov=tls --cov=config \
             --cov-report=xml:coverage-unit.xml \
+            --cov-fail-under=0 \
             --junitxml=junit-unit.xml \
             -n auto
       - name: Upload coverage
@@ -146,10 +153,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Run integration tests
+        # See the unit-tests job for why --cov-fail-under=0 here:
+        # per-job gate is bypassed; coverage-gate enforces 85%
+        # on the combined artifacts.
         run: |
           pytest -m "integration and not slow" --timeout=60 \
             --cov=server --cov=middleware --cov=tls --cov=config \
-            --cov-report=xml:coverage-int-${{ matrix.os }}.xml
+            --cov-report=xml:coverage-int-${{ matrix.os }}.xml \
+            --cov-fail-under=0
       - name: Legacy shell test matrices
         run: |
           # Start server for curl_tests.sh / negative_tests.sh
