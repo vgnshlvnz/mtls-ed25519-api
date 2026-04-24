@@ -36,9 +36,15 @@ logs/
 
 # Phase-5 cert-pinning fingerprint (regenerable via `make pin`)
 pki/server/server.fingerprint
+pki/nginx/nginx.fingerprint
 
 # Test-suite artifacts (pytest + coverage.py)
 .pytest_cache/
 .coverage
 .coverage.*
 htmlcov/
+
+# nginx v1.2 runtime — generated from nginx/nginx.conf by nginx-test-gen.sh
+nginx/nginx-test.conf
+nginx/logs/
+.nginx.log
