@@ -34,11 +34,10 @@ import ssl
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 import uvicorn
-from fastapi import Body, FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
 
 from middleware import ClientIdentityMiddleware
 from tls import CertAwareH11Protocol, build_server_context
@@ -91,6 +90,9 @@ logger = _configure_logging()
 class HealthResponse(BaseModel):
     status: str
     tls: bool
+    # Version is populated from app.version at request time so it
+    # tracks the FastAPI metadata without a second source of truth.
+    version: str
 
 
 class SensorReading(BaseModel):
@@ -105,8 +107,24 @@ class DataResponse(BaseModel):
     generated_at: str
 
 
+class SensorIn(BaseModel):
+    """Validated body shape for ``POST /data``.
+
+    Pydantic's default behaviour applies:
+    - missing ``sensor_id`` / ``value`` / ``unit``: 422 response
+    - non-coercible ``value`` (``"hot"`` etc.): 422
+    - integer ``value`` is silently coerced to float
+    - unknown extra keys are accepted and dropped from the echo (the
+      response only carries the validated fields).
+    """
+
+    sensor_id: str = Field(min_length=1)
+    value: float
+    unit: str = Field(min_length=1)
+
+
 class EchoResponse(BaseModel):
-    received: dict[str, Any]
+    received: SensorIn
     echoed_at: str
 
 
@@ -158,13 +176,13 @@ _sslproto.SSLProtocol._fatal_error = _logging_fatal_error
 
 # --- FastAPI app ------------------------------------------------------------
 
-app = FastAPI(title="mTLS ED25519 REST API", version="0.3.0")
+app = FastAPI(title="mTLS ED25519 REST API", version="0.4.0")
 app.add_middleware(ClientIdentityMiddleware)
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse(status="ok", tls=True)
+    return HealthResponse(status="ok", tls=True, version=app.version)
 
 
 @app.get("/data", response_model=DataResponse)
@@ -188,7 +206,9 @@ async def get_data() -> DataResponse:
 
 
 @app.post("/data", response_model=EchoResponse)
-async def post_data(payload: dict[str, Any] = Body(...)) -> EchoResponse:
+async def post_data(payload: SensorIn) -> EchoResponse:
+    # Pydantic already validated sensor_id, value, unit; extra JSON
+    # keys were dropped during parsing and are absent from the echo.
     return EchoResponse(received=payload, echoed_at=_utcnow_iso())
 
 
