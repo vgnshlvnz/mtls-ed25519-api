@@ -28,6 +28,7 @@ import asyncio
 import asyncio.sslproto as _sslproto
 import datetime as dt
 import logging
+import os
 import shutil
 import ssl
 import subprocess
@@ -57,7 +58,10 @@ OPENSSL_CNF = PKI_DIR / "openssl.cnf"
 CA_INDEX = PKI_DIR / "ca" / "index.txt"
 
 BIND_HOST = "127.0.0.1"
-BIND_PORT = 8443
+# Port override via env var so the pytest integration fixture can pick a
+# free port when 8443 is already held by a long-running `make server`.
+# Operational default (8443) is unchanged when MTLS_API_PORT is unset.
+BIND_PORT = int(os.environ.get("MTLS_API_PORT", "8443"))
 
 
 # --- Logging ----------------------------------------------------------------

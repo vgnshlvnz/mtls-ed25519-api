@@ -36,3 +36,9 @@ logs/
 
 # Phase-5 cert-pinning fingerprint (regenerable via `make pin`)
 pki/server/server.fingerprint
+
+# Test-suite artifacts (pytest + coverage.py)
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/

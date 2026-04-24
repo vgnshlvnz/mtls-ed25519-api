@@ -2,11 +2,22 @@
 #
 # Install with:   pip install -r requirements-dev.txt
 #
-# These are only needed when running the Phase-4 test harness or the
-# Phase-3 unittests — the runtime server itself (server.py) has no
-# dependency on requests or httpx.
+# The runtime server itself (server.py) has no dependency on requests,
+# httpx, or pytest — these are only needed for the test harness.
 
 -r requirements.txt
 
+# HTTP clients used by the integration test suite.
 requests>=2.28,<3.0
 httpx>=0.24,<1.0
+
+# Test runner + extensions.
+#   pytest-asyncio    — async test support (asyncio_mode=auto in pyproject.toml)
+#   pytest-cov        — coverage plugin backed by coverage.py
+#   pytest-timeout    — per-test timeout guard; keeps integration tests from hanging
+#   pytest-xdist      — parallel test execution (`pytest -n auto`)
+pytest>=8.0,<10.0
+pytest-asyncio>=0.23,<2.0
+pytest-cov>=5.0,<8.0
+pytest-timeout>=2.3,<3.0
+pytest-xdist>=3.5,<4.0
