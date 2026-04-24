@@ -48,13 +48,23 @@ def extract_cn(peer_cert: dict[str, Any] | None) -> str | None:
     Accepts the nested-tuple structure produced by
     ``ssl.SSLSocket.getpeercert()`` (the only format this project cares
     about — we never parse DER ourselves).
+
+    SECURITY: unexpected shapes (wrong nesting depth, non-iterable RDNs)
+    are treated as "no CN found" rather than propagating the exception.
+    The allowlist check above then denies the request with reason
+    ``no_peer_cert`` — a fail-closed posture consistent with the rest
+    of the stack.
     """
     if not peer_cert:
         return None
     for rdn in peer_cert.get("subject", ()):
-        for key, value in rdn:
-            if key == "commonName":
-                return value
+        try:
+            for key, value in rdn:
+                if key == "commonName":
+                    return value
+        except (TypeError, ValueError):
+            # Malformed RDN — fail closed by skipping, keep scanning.
+            continue
     return None
 
 

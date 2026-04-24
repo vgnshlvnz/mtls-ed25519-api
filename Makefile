@@ -44,7 +44,7 @@ endef
 # `make pki`, `make revoke`, `make renew`, and `make pin` all stay usable on
 # a clean clone that hasn't built its venv yet — they shell out to openssl /
 # bash / awk and never touch Python.
-VENV_REQUIRED_GOALS := server test
+VENV_REQUIRED_GOALS := server test test-unit test-integration test-cov test-all
 ifneq ($(filter $(VENV_REQUIRED_GOALS),$(MAKECMDGOALS)),)
 ifeq (,$(wildcard $(PY)))
 $(error Python venv not found at '$(VENV)/'. Run: python -m venv venv && source venv/bin/activate && pip install -r requirements-dev.txt)
@@ -52,7 +52,7 @@ endif
 endif
 
 # --- Phony declarations -----------------------------------------------------
-.PHONY: help pki server stop test revoke renew pin clean
+.PHONY: help pki server stop test test-unit test-integration test-cov test-all revoke renew pin clean
 
 # Default target is `help` so a bare `make` tells you what's available.
 .DEFAULT_GOAL := help
@@ -118,19 +118,32 @@ stop:  ## Stop the background server (no-op if not running)
 		rm -f $(PID_FILE); \
 	fi
 
-test:  ## Run the full test suite (unittests + curl matrix + Python clients)
-	$(call INFO,unittest)
-	@$(PY) -m unittest tests.test_middleware
+test:  ## Run the full test suite (pytest unit + integration + curl matrix)
+	$(call INFO,pytest — unit + integration)
+	@$(PY) -m pytest
 	$(call INFO,curl_tests.sh)
 	@./tests/curl_tests.sh
 	$(call INFO,negative_tests.sh)
 	@./tests/negative_tests.sh
-	$(call INFO,client_test.py  [sync / requests])
-	@$(PY) tests/client_test.py >/dev/null && \
-		printf '%b[make]%b client_test.py PASS\n' "$(C_GREEN)" "$(C_RESET)"
-	$(call INFO,client_async.py [async / httpx])
-	@$(PY) tests/client_async.py >/dev/null && \
-		printf '%b[make]%b client_async.py PASS\n' "$(C_GREEN)" "$(C_RESET)"
+
+test-unit:  ## Run only pytest unit tests (no network, no subprocess)
+	$(call INFO,pytest -m unit)
+	@$(PY) -m pytest -m unit
+
+test-integration:  ## Run only pytest integration tests (starts server subprocess)
+	$(call INFO,pytest -m integration)
+	@$(PY) -m pytest -m integration
+
+test-cov:  ## Run full pytest with coverage (HTML at htmlcov/, threshold in .coveragerc)
+	$(call INFO,pytest --cov — branch coverage, fail_under=70)
+	@$(PY) -m pytest \
+		--cov=server --cov=middleware --cov=tls --cov=config \
+		--cov-report=html --cov-report=term-missing
+	$(call INFO,HTML report at htmlcov/index.html)
+
+test-all:  ## Run unit tests then integration tests (sequential, distinct markers)
+	@$(MAKE) --no-print-directory test-unit
+	@$(MAKE) --no-print-directory test-integration
 
 revoke:  ## Revoke client-01 and regenerate the CRL (server restart needed after)
 	$(call INFO,revoking pki/client/client.crt)
