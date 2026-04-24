@@ -36,3 +36,8 @@ locust>=2.20,<3.0
 # PKI lifecycle tests (T5) construct CRLs with arbitrary time windows —
 # openssl CLI can't easily produce a CRL with nextUpdate in the past.
 cryptography>=42.0,<50.0
+
+# Mutation testing + dead-code analysis (T9). Run explicitly via
+# `make mutation` / `make deadcode`; NOT part of make test-all.
+mutmut>=3.0,<4.0
+vulture>=2.10,<3.0
