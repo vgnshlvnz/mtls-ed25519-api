@@ -434,13 +434,18 @@ def attack_leaves(project_ca_mirror: RogueCA) -> dict[str, dict[str, Path]]:
     per-test hot path — each leaf is generated exactly once per
     session.
     """
+    # IMPORTANT: use distinct CNs so the three leaves land in
+    # distinct files on disk. sign_client() derives the cert
+    # filename from the CN, so re-using "client-01" would silently
+    # overwrite earlier signings and every Leaf.cert would point to
+    # the last-written file.
     expired = project_ca_mirror.sign_client(
-        "client-01",
+        "client-01-expired",
         start="200101010000Z",
         end="200102010000Z",
     )
     future = project_ca_mirror.sign_client(
-        "client-01",
+        "client-01-future",
         start="400101010000Z",
         end="400201010000Z",
     )
@@ -449,7 +454,7 @@ def attack_leaves(project_ca_mirror: RogueCA) -> dict[str, dict[str, Path]]:
     # chain but the ClientCertificateVerify step relies on the leaf's
     # digitalSignature usage.
     wrong_ku = project_ca_mirror.sign_client(
-        "client-01",
+        "client-01-wrong-ku",
         key_usage="dataEncipherment",
         eku="clientAuth",
     )

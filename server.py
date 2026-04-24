@@ -283,11 +283,45 @@ def _refresh_crl() -> None:
 # --- Entrypoint -------------------------------------------------------------
 
 
+def _warn_if_server_cert_near_expiry(
+    server_cert: Path, threshold_days: int = 7
+) -> None:
+    """Emit a WARNING if the server cert expires within ``threshold_days``.
+
+    Operators miss cert rotations until a handshake fails. A coarse
+    pre-flight check at startup gives ops a chance to rotate before
+    the cert actually expires. Soft-fails on parse errors — TLS
+    context build will catch a truly broken cert.
+    """
+    try:
+        from cryptography import x509  # local import keeps startup fast
+
+        cert = x509.load_pem_x509_certificate(server_cert.read_bytes())
+        not_after = cert.not_valid_after_utc
+        now = dt.datetime.now(dt.UTC)
+        remaining = not_after - now
+        if remaining <= dt.timedelta(days=threshold_days):
+            logger.warning(
+                "server_cert_near_expiry remaining_days=%.1f not_after=%s",
+                remaining.total_seconds() / 86400,
+                not_after.isoformat(),
+            )
+    except ImportError:
+        # cryptography is a dev-only dep; soft-skip in prod-only runs.
+        return
+    except Exception as exc:
+        logger.warning("server_cert_expiry_check_failed reason=%s", exc)
+
+
 def main() -> None:
     # Regenerate the CRL before building the SSLContext, so the loaded
     # CRL has a fresh nextUpdate. See _refresh_crl docstring for why
     # this matters — without it the service dies after 7 days.
     _refresh_crl()
+
+    # Surface expiring server certs at startup so operators can rotate
+    # before the cert actually expires mid-handshake.
+    _warn_if_server_cert_near_expiry(SERVER_CERT)
 
     # SECURITY: build the SSLContext up front. A bad path/permission problem
     # must crash the process before we bind the port, not mid-handshake.
