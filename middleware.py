@@ -107,7 +107,27 @@ def extract_cn_from_headers(request: Request) -> str | None:
         )
         return None
 
-    return request.headers.get("X-Client-CN") or None
+    raw_cn = request.headers.get("X-Client-CN")
+    if raw_cn is None:
+        return None
+
+    # SECURITY (SI-3): even though the IP trust gate keeps most
+    # adversaries out, a bug in nginx's sanitisation or a future
+    # config mistake could put a forged CN into this path. Reject
+    # anything that could forge a second log line or truncate
+    # downstream: embedded newlines, carriage returns, or NUL
+    # bytes. Whitespace is stripped; the resulting empty string
+    # is also a reject (empty CN is meaningless for the allowlist).
+    cn = raw_cn.strip()
+    if not cn or "\n" in cn or "\r" in cn or "\x00" in cn:
+        logger.warning(
+            "cn_sanitisation_failed mode=nginx reason=%s client_ip=%s",
+            "empty" if not cn else "control_char",
+            client_ip,
+        )
+        return None
+
+    return cn
 
 
 def subject_fingerprint(peer_cert: dict[str, Any] | None) -> str:
