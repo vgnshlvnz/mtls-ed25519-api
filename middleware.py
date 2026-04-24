@@ -95,6 +95,34 @@ def subject_fingerprint(peer_cert: dict[str, Any] | None) -> str:
     return hashlib.sha256(flat.encode("utf-8")).hexdigest()[:16]
 
 
+def cert_serial(peer_cert: dict[str, Any] | None) -> str:
+    """Return the peer cert's serial number (hex string) for audit logs.
+
+    Returns ``"-"`` when no peer cert is available. The serial is the
+    closest thing to a stable unique identifier for a single issued
+    cert — operators need it to correlate revocation events with
+    log lines (T10 CA3).
+    """
+    if not peer_cert:
+        return "-"
+    # stdlib getpeercert() exposes serial under "serialNumber" as a hex
+    # string (upper-case, no 0x). Keep that format verbatim for
+    # correlation with `openssl x509 -noout -serial` output.
+    return str(peer_cert.get("serialNumber", "-"))
+
+
+def cert_not_after(peer_cert: dict[str, Any] | None) -> str:
+    """Return the peer cert's notAfter string for audit logs.
+
+    stdlib formats this as a GMT datetime string (``"Apr 24 00:00:00
+    2027 GMT"``). Pass through as-is; callers that want ISO 8601
+    parse on their end.
+    """
+    if not peer_cert:
+        return "-"
+    return str(peer_cert.get("notAfter", "-"))
+
+
 # --- 403 helper -------------------------------------------------------------
 
 
@@ -134,6 +162,8 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
         )
         client_cn = extract_cn(peer_cert)
         fingerprint = subject_fingerprint(peer_cert)
+        serial = cert_serial(peer_cert)
+        not_after = cert_not_after(peer_cert)
         peer_addr = request.client.host if request.client else "-"
 
         # Always attach context to request.state so route handlers and error
@@ -150,6 +180,8 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
                 "path": request.url.path,
                 "cn": _safe_for_log(client_cn),
                 "subj": fingerprint,
+                "cert_serial_number": serial,
+                "cert_not_after": not_after,
                 "reqid": request_id,
                 "peer": peer_addr,
             },
@@ -214,6 +246,8 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
 
 __all__ = [
     "ClientIdentityMiddleware",
+    "cert_not_after",
+    "cert_serial",
     "extract_cn",
     "subject_fingerprint",
 ]
