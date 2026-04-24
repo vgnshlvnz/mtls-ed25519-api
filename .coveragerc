@@ -1,0 +1,46 @@
+# Coverage configuration for the mTLS ED25519 API.
+#
+# The project keeps server-side source as flat top-level modules
+# (server.py, middleware.py, tls.py, config.py) rather than a `server/`
+# package, so `source` is enumerated explicitly instead of pointing at a
+# single directory. Tests, helper scripts, and the venv are excluded.
+#
+# fail_under = 70 is the T1 baseline. Each subsequent phase is expected
+# to hold or raise the floor.
+
+[run]
+branch = True
+# Data files use a per-process suffix so the coverage picked up inside
+# the server subprocess (see tests/conftest.py :: server_process) does
+# not clobber the parent run. `coverage combine` merges them before the
+# final report. pytest-cov runs combine automatically when --cov is set.
+parallel = True
+# Save coverage data on SIGTERM too (coverage 6.0+). The test fixture
+# stops the server subprocess via ``terminate()``, which fires SIGTERM;
+# without this flag, nothing in the child runs atexit handlers and the
+# collected data is dropped on the floor.
+sigterm = True
+source =
+    server
+    middleware
+    tls
+    config
+
+omit =
+    venv/*
+    tests/*
+    */__pycache__/*
+    pinned_client.py
+
+[report]
+fail_under = 70
+show_missing = True
+skip_covered = False
+precision = 1
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if __name__ == .__main__.:
+
+[html]
+directory = htmlcov
