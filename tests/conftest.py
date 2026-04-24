@@ -412,6 +412,20 @@ def project_ca_mirror(
 
 
 @pytest.fixture(scope="session")
+def wrong_cn_leaf(project_ca_mirror: RogueCA) -> dict[str, Path]:
+    """A leaf that chains to the project CA but carries a CN NOT in the allowlist.
+
+    Passes the TLS handshake (issuer is trusted, validity window is now,
+    KeyUsage is correct) but the middleware's CN allowlist check will
+    return 403 with reason=cn_not_allowlisted. Used by CS3 mixed-client
+    stress test and any future authz test that needs a 'trusted-but-
+    unauthorised' peer.
+    """
+    leaf = project_ca_mirror.sign_client("not-on-allowlist-001")
+    return {"cert": leaf.cert, "key": leaf.key}
+
+
+@pytest.fixture(scope="session")
 def attack_leaves(project_ca_mirror: RogueCA) -> dict[str, dict[str, Path]]:
     """Batch-produce leaf certs that chain to the project CA but carry
     exactly one leaf-level defect each.
