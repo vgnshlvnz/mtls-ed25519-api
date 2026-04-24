@@ -1,6 +1,6 @@
 """Unit tests for the identity middleware helpers.
 
-Exercises ``extract_cn`` and ``subject_fingerprint`` by feeding in dicts
+Exercises ``extract_cn_from_cert`` and ``subject_fingerprint`` by feeding in dicts
 shaped exactly like the output of ``ssl.SSLSocket.getpeercert()`` — a
 nested tuple of RDNs. That shape is the full mock surface; nothing in
 the middleware's pure path looks past it.
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from middleware import extract_cn, subject_fingerprint
+from middleware import extract_cn_from_cert, subject_fingerprint
 
 
 # --- Test helpers -----------------------------------------------------------
@@ -39,7 +39,7 @@ def _mock_peer_cert(cn: str, *, extra_rdns: tuple = ()) -> dict:
     }
 
 
-# --- extract_cn -------------------------------------------------------------
+# --- extract_cn_from_cert -------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -68,7 +68,7 @@ def _mock_peer_cert(cn: str, *, extra_rdns: tuple = ()) -> dict:
 )
 def test_extract_cn_table(peer_cert: dict | None, expected: str | None) -> None:
     """Table-driven coverage of the five canonical input shapes."""
-    assert extract_cn(peer_cert) == expected
+    assert extract_cn_from_cert(peer_cert) == expected
 
 
 @pytest.mark.unit
@@ -81,7 +81,7 @@ def test_extract_cn_unicode_cn_preserved() -> None:
     through a unicode-normalisation gap.
     """
     cn = "клиент-01"
-    assert extract_cn(_mock_peer_cert(cn)) == cn
+    assert extract_cn_from_cert(_mock_peer_cert(cn)) == cn
 
 
 @pytest.mark.unit
@@ -100,7 +100,7 @@ def test_extract_cn_malformed_subject_is_rejected() -> None:
     # The helper tolerates unexpected shapes by iterating what it has;
     # a shape that doesn't yield a ("commonName", value) pair simply
     # results in None, never an exception.
-    assert extract_cn(cert_wrong_depth) is None
+    assert extract_cn_from_cert(cert_wrong_depth) is None
 
 
 @pytest.mark.unit
@@ -112,7 +112,7 @@ def test_extract_cn_empty_string_value() -> None:
     allowlist check with reason=cn_not_allowlisted, but the distinction
     matters for log correlation. This test locks the invariant in.
     """
-    assert extract_cn(_mock_peer_cert("")) == ""
+    assert extract_cn_from_cert(_mock_peer_cert("")) == ""
 
 
 # --- subject_fingerprint ----------------------------------------------------

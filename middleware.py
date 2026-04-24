@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # --- Cert inspection helpers ------------------------------------------------
 
 
-def extract_cn(peer_cert: dict[str, Any] | None) -> str | None:
+def extract_cn_from_cert(peer_cert: dict[str, Any] | None) -> str | None:
     """Return the Subject CommonName from a stdlib-format peer cert dict.
 
     Accepts the nested-tuple structure produced by
@@ -114,7 +114,7 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
         peer_cert: dict[str, Any] | None = (
             request.scope.get("extensions", {}).get("tls", {}).get("peer_cert")
         )
-        client_cn = extract_cn(peer_cert)
+        client_cn = extract_cn_from_cert(peer_cert)
         fingerprint = subject_fingerprint(peer_cert)
         peer_addr = request.client.host if request.client else "-"
 
@@ -182,6 +182,6 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
 
 __all__ = [
     "ClientIdentityMiddleware",
-    "extract_cn",
+    "extract_cn_from_cert",
     "subject_fingerprint",
 ]
