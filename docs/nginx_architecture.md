@@ -1,0 +1,139 @@
+# Nginx Termination Architecture (v1.1)
+
+Reference doc for the N1–N5 integration series. v1.0 ran FastAPI
+directly behind Python's `ssl.CERT_REQUIRED`; v1.1 puts nginx in
+front as the mTLS terminator.
+
+## Topology
+
+### v1.0 — direct mTLS (Python ssl module)
+
+```
+   ┌──────────┐          mTLS (TLS 1.2+)          ┌─────────────────┐
+   │  Client  │◄──────────────────────────────────┤  FastAPI :8443  │
+   │  (+cert) │     ssl.CERT_REQUIRED +           │  stdlib ssl     │
+   └──────────┘     CN allowlist (middleware)     └─────────────────┘
+```
+
+Single process, single trust surface. Everything in `tls.py` +
+`middleware.py` enforces the peer identity.
+
+### v1.1 — nginx terminates mTLS, FastAPI runs plain HTTP (NGINX_MODE)
+
+```
+   ┌──────────┐        mTLS :443        ┌────────┐   plain HTTP     ┌─────────────────┐
+   │  Client  │◄───────────────────────►│ nginx  │◄────────────────►│  FastAPI :8443  │
+   │  (+cert) │   (ssl_verify_client on)│ (1.24) │  127.0.0.1 only  │  (NGINX_MODE)   │
+   └──────────┘                         └────────┘                  └─────────────────┘
+                                             │
+                                             │  forwarded headers:
+                                             │    X-Client-CN          (from $ssl_client_s_dn map)
+                                             │    X-Client-DN          (full RFC 2253 DN)
+                                             │    X-Client-Verify      (SUCCESS | FAILED:<reason>)
+                                             │    X-Client-Serial
+                                             │    X-Client-Fingerprint
+                                             │    X-Forwarded-For
+                                             ▼
+                                    middleware.ClientIdentityMiddleware
+                                    (dual-mode; see N2)
+```
+
+## Trust model (N2 onwards)
+
+The single biggest risk of this architecture is a caller reaching
+FastAPI's plain-HTTP port directly and forging the
+`X-Client-CN: client-01` header. The middleware refuses to honour
+those headers unless the request's source IP is in
+`config.TRUSTED_PROXY_IPS` (default `127.0.0.1`).
+
+```
+if request.client.host not in TRUSTED_PROXY_IPS:
+    # Someone reached us directly. Refuse to use any X-Client-* header.
+    deny()
+```
+
+Invariants (SI-1 through SI-4, wired in N2):
+
+| # | Rule |
+|---|------|
+| SI-1 | `X-Client-CN` is trusted only when source IP ∈ `TRUSTED_PROXY_IPS` |
+| SI-2 | `X-Client-Verify` must be `SUCCESS` — defence-in-depth beyond TLS |
+| SI-3 | CN sanitisation rejects newline / null-byte / control chars (log injection) |
+| SI-4 | `NGINX_MODE=true` with empty `TRUSTED_PROXY_IPS` fails startup |
+
+The critical test that proves this works is **ND1** (N3):
+
+```bash
+curl -s http://127.0.0.1:8443/health \
+  -H "X-Client-CN: client-01" \
+  -H "X-Client-Verify: SUCCESS"
+# Must produce: {"error": "forbidden", ...}
+```
+
+If ND1 ever returns 200, the architecture is broken and the nginx
+integration is insecure. Phase N4 must not run until ND1 passes.
+
+## PKI layout
+
+`pki_setup.sh` now mints four leaves under one CA, all ED25519:
+
+```
+pki/
+├── ca/                    ── self-signed root (10 y validity)
+│   ├── ca.crt             ── trust anchor for every leaf below
+│   └── ca.key             (gitignored, chmod 600)
+│
+├── server/                ── FastAPI cert (legacy direct-mTLS mode)
+│   ├── server.crt
+│   └── server.key         (gitignored, chmod 600)
+│
+├── client/                ── client identity (CN=client-01)
+│   ├── client.crt
+│   └── client.key         (gitignored, chmod 600)
+│
+└── nginx/                 ── N1 addition — nginx termination cert
+    ├── nginx.crt          SAN: localhost, 127.0.0.1, nginx
+    └── nginx.key          (gitignored, chmod 640 so www-data can read)
+```
+
+Nginx runs as `www-data` on standard Debian/Ubuntu, hence the 640
+perm on `nginx.key` vs 600 on the others. If `www-data` is absent
+(`getent group www-data` fails), `pki_setup.sh` skips the chgrp
+and leaves the file owner-readable only.
+
+## Nginx config files
+
+```
+nginx/
+├── nginx.conf          template with PKI_DIR / LOG_DIR / HTTPS_PORT placeholders
+├── ssl_params.conf     shared TLS protocol + cipher block (include'd)
+├── nginx-test.conf     generated by nginx-test-gen.sh (GITIGNORED)
+├── nginx-test-gen.sh   substitutes placeholders, writes test config
+└── logs/               (gitignored) nginx pid / access / error / temp paths
+```
+
+The generator lets us run `nginx -t` without root: the test config
+uses unprivileged ports (`8444` HTTPS, `8081` HTTP) and points all
+nginx runtime paths at `nginx/logs/`. Production deploys use
+`HTTPS_PORT=443 HTTP_PORT=80 bash nginx-test-gen.sh` to emit a
+config that binds to the privileged ports.
+
+## Day-to-day commands (N1)
+
+| Make target | What it does |
+|-------------|--------------|
+| `make nginx-check` | Regenerate `nginx-test.conf` and run `nginx -t` |
+| `make nginx-start` | Start nginx with the test config (backgrounds) |
+| `make nginx-stop` | `nginx -s quit` — graceful drain |
+| `make nginx-reload` | Regenerate config + `nginx -s reload` (HUP) |
+| `make nginx-server` | `nginx-start` + FastAPI with `NGINX_MODE=true` |
+| `make nginx-stop-all` | Stop both processes |
+
+## What changes in subsequent phases
+
+| Phase | What it adds |
+|-------|--------------|
+| N2 | Middleware dual-mode: read `X-Client-CN` only when source is trusted proxy; FastAPI switches to plain HTTP bind when `NGINX_MODE=true` |
+| N3 | 27+ auth tests — Groups A (direct TLS) / B (nginx happy) / C (nginx rejections) / D (header injection) including ND1 |
+| N4 | Handshake benchmarks + concurrency + Locust, once ND1 locks in the trust model |
+| N5 | CI jobs `nginx-config-lint` + `nginx-auth-tests`, wiki update, `v1.1.0` tag |
