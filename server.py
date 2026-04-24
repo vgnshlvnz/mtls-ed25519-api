@@ -27,18 +27,17 @@ from __future__ import annotations
 import asyncio
 import asyncio.sslproto as _sslproto
 import datetime as dt
-import logging
 import os
 import shutil
 import ssl
 import subprocess
-import sys
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+from logging_config import configure_json_logging
 from middleware import ClientIdentityMiddleware
 from tls import CertAwareH11Protocol, build_server_context
 
@@ -66,22 +65,7 @@ BIND_PORT = int(os.environ.get("MTLS_API_PORT", "8443"))
 # --- Logging ----------------------------------------------------------------
 
 
-def _configure_logging() -> logging.Logger:
-    """Install the project's single stdout-only log config."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(name)s :: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-        stream=sys.stdout,
-        force=True,
-    )
-    # The middleware emits richer lines (CN, request-id), so uvicorn's
-    # per-request access log is redundant noise.
-    logging.getLogger("uvicorn.access").disabled = True
-    return logging.getLogger("mtls_api")
-
-
-logger = _configure_logging()
+logger = configure_json_logging()
 
 
 # --- Pydantic models --------------------------------------------------------
@@ -93,6 +77,10 @@ class HealthResponse(BaseModel):
     # Version is populated from app.version at request time so it
     # tracks the FastAPI metadata without a second source of truth.
     version: str
+    # T7 observability fields — documented in docs/log_schema.md.
+    uptime_seconds: float
+    cert_expires_in_days: float | None
+    crl_age_seconds: float | None
 
 
 class SensorReading(BaseModel):
@@ -176,13 +164,51 @@ _sslproto.SSLProtocol._fatal_error = _logging_fatal_error
 
 # --- FastAPI app ------------------------------------------------------------
 
-app = FastAPI(title="mTLS ED25519 REST API", version="0.4.0")
+app = FastAPI(title="mTLS ED25519 REST API", version="0.5.0")
 app.add_middleware(ClientIdentityMiddleware)
+
+
+_SERVER_STARTED_AT = dt.datetime.now(dt.UTC)
+
+
+def _cert_expires_in_days() -> float | None:
+    """Days until the server cert's notAfter, or None if unreadable."""
+    try:
+        from cryptography import x509  # dev-only dep; soft-skip
+
+        cert = x509.load_pem_x509_certificate(SERVER_CERT.read_bytes())
+        delta = cert.not_valid_after_utc - dt.datetime.now(dt.UTC)
+        return round(delta.total_seconds() / 86400, 2)
+    except Exception:
+        return None
+
+
+def _crl_age_seconds() -> float | None:
+    """Seconds since the CRL file's lastUpdate, or None if absent."""
+    try:
+        if not CA_CRL.is_file():
+            return None
+        # Use file mtime as a conservative proxy — the CRL's own
+        # lastUpdate would require parsing the DER. The server
+        # regenerates the CRL at startup, so mtime == lastUpdate
+        # within a few ms.
+        mtime = dt.datetime.fromtimestamp(CA_CRL.stat().st_mtime, dt.UTC)
+        return round((dt.datetime.now(dt.UTC) - mtime).total_seconds(), 2)
+    except Exception:
+        return None
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse(status="ok", tls=True, version=app.version)
+    now = dt.datetime.now(dt.UTC)
+    return HealthResponse(
+        status="ok",
+        tls=True,
+        version=app.version,
+        uptime_seconds=round((now - _SERVER_STARTED_AT).total_seconds(), 2),
+        cert_expires_in_days=_cert_expires_in_days(),
+        crl_age_seconds=_crl_age_seconds(),
+    )
 
 
 @app.get("/data", response_model=DataResponse)
@@ -335,8 +361,22 @@ def main() -> None:
         "tls_context mode=CERT_REQUIRED min_version=%s ciphers=%d",
         tls_ctx.minimum_version.name,
         len(tls_ctx.get_ciphers()),
+        extra={
+            "event": "tls_context",
+            "mode": "CERT_REQUIRED",
+            "min_version": tls_ctx.minimum_version.name,
+            "ciphers": len(tls_ctx.get_ciphers()),
+        },
     )
-    logger.info("binding https://%s:%d (mTLS: required)", BIND_HOST, BIND_PORT)
+    logger.info(
+        "server_started",
+        extra={
+            "event": "server_started",
+            "bind_addr": f"{BIND_HOST}:{BIND_PORT}",
+            "tls_version_min": tls_ctx.minimum_version.name,
+            "cert_expiry_days": _cert_expires_in_days(),
+        },
+    )
 
     config = uvicorn.Config(
         app=app,
@@ -362,6 +402,10 @@ def main() -> None:
         # helps attackers fingerprint patch levels (T6 ID1).
         server_header=False,
         date_header=False,
+        # Don't hang forever on SIGTERM waiting for HTTP keep-alive
+        # connections to close. 5s is plenty for in-flight work and
+        # bounds the worst-case restart latency.
+        timeout_graceful_shutdown=5,
     )
     config.load()
     # SECURITY: replace uvicorn's implicitly-built SSLContext with the one

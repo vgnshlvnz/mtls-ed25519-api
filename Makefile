@@ -141,6 +141,10 @@ test-cov:  ## Run full pytest with coverage (HTML at htmlcov/, threshold in .cov
 		--cov-report=html --cov-report=term-missing
 	$(call INFO,HTML report at htmlcov/index.html)
 
+test-observability:  ## Run the T7 observability + operational suite
+	$(call INFO,pytest tests/test_observability.py)
+	@$(PY) -m pytest tests/test_observability.py
+
 test-all:  ## Run unit tests then integration tests (sequential, distinct markers)
 	@$(MAKE) --no-print-directory test-unit
 	@$(MAKE) --no-print-directory test-integration

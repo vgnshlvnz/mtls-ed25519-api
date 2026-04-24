@@ -143,13 +143,16 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
         request.state.subject_fingerprint = fingerprint
 
         logger.info(
-            "req_start method=%s path=%s cn=%s subj=%s reqid=%s peer=%s",
-            request.method,
-            request.url.path,
-            _safe_for_log(client_cn),
-            fingerprint,
-            request_id,
-            peer_addr,
+            "req_start",
+            extra={
+                "event": "req_start",
+                "method": request.method,
+                "path": request.url.path,
+                "cn": _safe_for_log(client_cn),
+                "subj": fingerprint,
+                "reqid": request_id,
+                "peer": peer_addr,
+            },
         )
 
         # SECURITY: in normal operation the TLS layer guarantees a verified
@@ -157,9 +160,13 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
         # absent, something upstream is mis-configured — fail closed.
         if client_cn is None:
             logger.warning(
-                "authz_reject reason=no_peer_cert reqid=%s peer=%s",
-                request_id,
-                peer_addr,
+                "authz_reject",
+                extra={
+                    "event": "authz_reject",
+                    "reason": "no_peer_cert",
+                    "reqid": request_id,
+                    "peer": peer_addr,
+                },
             )
             return _forbidden(None, "no_peer_cert", request_id)
 
@@ -167,11 +174,15 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
         # sufficient; the identity must also be on the admit list.
         if client_cn not in ALLOWED_CLIENT_CNS:
             logger.warning(
-                "authz_reject reason=cn_not_allowlisted cn=%s subj=%s reqid=%s peer=%s",
-                _safe_for_log(client_cn),
-                fingerprint,
-                request_id,
-                peer_addr,
+                "authz_reject",
+                extra={
+                    "event": "authz_reject",
+                    "reason": "cn_not_allowlisted",
+                    "cn": _safe_for_log(client_cn),
+                    "subj": fingerprint,
+                    "reqid": request_id,
+                    "peer": peer_addr,
+                },
             )
             return _forbidden(client_cn, "cn_not_allowlisted", request_id)
 
@@ -188,12 +199,15 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
 
         response.headers["X-Request-ID"] = request_id
         logger.info(
-            "req_end   method=%s path=%s cn=%s reqid=%s status=%d",
-            request.method,
-            request.url.path,
-            _safe_for_log(client_cn),
-            request_id,
-            response.status_code,
+            "req_end",
+            extra={
+                "event": "req_end",
+                "method": request.method,
+                "path": request.url.path,
+                "cn": _safe_for_log(client_cn),
+                "reqid": request_id,
+                "status": response.status_code,
+            },
         )
         return response
 
