@@ -65,6 +65,18 @@ subjectAltName         = DNS:localhost, IP:127.0.0.1
 subjectKeyIdentifier   = hash
 authorityKeyIdentifier = keyid, issuer
 
+# --- Apache httpd termination leaf (v1.3) -----------------------------------
+# Used by the parallel Apache integration. Same shape as v3_nginx —
+# separate section purely so the cert lifecycles are independent.
+# Apache mod_ssl supports Ed25519 natively as of 2.4.41 (uses OpenSSL).
+[v3_apache]
+basicConstraints       = CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = serverAuth
+subjectAltName         = DNS:localhost, IP:127.0.0.1
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid, issuer
+
 # --- CA administration (Phase 5 CRL management) -----------------------------
 # Used by `openssl ca -revoke` and `openssl ca -gencrl`. These paths are
 # relative to the project root; any script calling `openssl ca` MUST
