@@ -68,6 +68,24 @@ def extract_cn(peer_cert: dict[str, Any] | None) -> str | None:
     return None
 
 
+_CONTROL_CHARS = {chr(c) for c in range(32)} | {chr(127)}
+
+
+def _safe_for_log(value: str | None) -> str:
+    """Return a version of ``value`` safe to interpolate into a log line.
+
+    Replaces control characters (incl. newline, null byte, ANSI
+    escape's ESC) with ``\\u00XX``-style hex, so a forged CN
+    cannot inject colour codes or newlines into the log stream.
+    Used by ``dispatch`` when building the structured log lines;
+    the underlying CN value on ``request.state.client_cn`` is
+    UNCHANGED — only the logged form is neutered.
+    """
+    if value is None:
+        return "-"
+    return "".join(c if c not in _CONTROL_CHARS else f"\\x{ord(c):02x}" for c in value)
+
+
 def subject_fingerprint(peer_cert: dict[str, Any] | None) -> str:
     """Short SHA-256 of the Subject DN — safe to log, stable across runs."""
     if not peer_cert:
@@ -128,7 +146,7 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
             "req_start method=%s path=%s cn=%s subj=%s reqid=%s peer=%s",
             request.method,
             request.url.path,
-            client_cn or "-",
+            _safe_for_log(client_cn),
             fingerprint,
             request_id,
             peer_addr,
@@ -150,7 +168,7 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
         if client_cn not in ALLOWED_CLIENT_CNS:
             logger.warning(
                 "authz_reject reason=cn_not_allowlisted cn=%s subj=%s reqid=%s peer=%s",
-                client_cn,
+                _safe_for_log(client_cn),
                 fingerprint,
                 request_id,
                 peer_addr,
@@ -173,7 +191,7 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
             "req_end   method=%s path=%s cn=%s reqid=%s status=%d",
             request.method,
             request.url.path,
-            client_cn,
+            _safe_for_log(client_cn),
             request_id,
             response.status_code,
         )
