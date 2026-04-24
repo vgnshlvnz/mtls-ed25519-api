@@ -174,5 +174,5 @@ clean:  ## Remove generated PKI artifacts, Python caches, server logs
 	        pki/server/server.fingerprint
 	@rm -rf pki/client/client.key pki/client/client.crt pki/client/client.csr
 	@find . -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
-	@rm -f $(SERVER_LOG) $(PID_FILE)
+	@rm -f $(SERVER_LOG) $(PID_FILE) .server-test-*.log
 	$(call INFO,done)

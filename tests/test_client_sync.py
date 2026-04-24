@@ -54,7 +54,12 @@ def test_get_health_returns_ok_and_tls_true(
     assert resp.headers.get("X-Request-ID"), "X-Request-ID header must be present"
 
     body = resp.json()
-    assert body == {"status": "ok", "tls": True}
+    assert body["status"] == "ok"
+    assert body["tls"] is True
+    # /health grew a `version` key in T3; assert presence but not a
+    # specific value here — the detailed contract is locked down in
+    # tests/test_api_contracts.py.
+    assert isinstance(body.get("version"), str) and body["version"]
 
 
 def test_get_data_returns_readings_and_timestamp(
