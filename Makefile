@@ -141,6 +141,17 @@ test-cov:  ## Run full pytest with coverage (HTML at htmlcov/, threshold in .cov
 		--cov-report=html --cov-report=term-missing
 	$(call INFO,HTML report at htmlcov/index.html)
 
+mutation:  ## Run mutmut mutation testing (slow — runs full test matrix per mutation)
+	$(call INFO,mutmut run — slow, ~5-10 min)
+	@$(VENV)/bin/mutmut run
+	$(call INFO,HTML at html/index.html)
+	@$(VENV)/bin/mutmut html
+
+deadcode:  ## Run vulture dead-code analysis
+	$(call INFO,vulture --min-confidence 80)
+	@$(VENV)/bin/vulture server.py middleware.py tls.py config.py \
+		logging_config.py tests/ whitelist.py --min-confidence 80
+
 test-observability:  ## Run the T7 observability + operational suite
 	$(call INFO,pytest tests/test_observability.py)
 	@$(PY) -m pytest tests/test_observability.py
