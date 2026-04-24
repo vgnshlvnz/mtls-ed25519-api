@@ -27,6 +27,10 @@ SERVER_LOG      := .server.log
 NGINX_CONF      := nginx/nginx-test.conf
 NGINX_PID       := nginx/logs/nginx.pid
 NGINX_LOG       := .nginx.log
+APACHE_CONF     := apache/apache-test.conf
+APACHE_DIR_ABS  := $(shell pwd)/apache
+APACHE_PID      := apache/logs/apache.pid
+APACHE_LOG      := .apache.log
 
 # ANSI colour escapes. Quoted via printf '%b' in recipes so they don't
 # bleed into logs when stdout is not a TTY.
@@ -45,7 +49,7 @@ define WARN
 endef
 
 # --- Guards -----------------------------------------------------------------
-VENV_REQUIRED_GOALS := server test test-unit test-integration test-cov test-all stack
+VENV_REQUIRED_GOALS := server test test-unit test-integration test-cov test-all stack stack-apache apache-server
 ifneq ($(filter $(VENV_REQUIRED_GOALS),$(MAKECMDGOALS)),)
 ifeq (,$(wildcard $(PY)))
 $(error Python venv not found at '$(VENV)/'. Run: python -m venv venv && source venv/bin/activate && pip install -r requirements-dev.txt)
@@ -55,7 +59,9 @@ endif
 # --- Phony declarations -----------------------------------------------------
 .PHONY: help pki server stop test test-unit test-integration test-cov test-all \
         revoke renew pin clean \
-        nginx-config nginx-start nginx-stop nginx-reload stack
+        nginx-config nginx-start nginx-stop nginx-reload stack \
+        apache-check apache-start apache-stop apache-reload apache-server \
+        apache-stop-all stack-apache
 
 .DEFAULT_GOAL := help
 
@@ -167,6 +173,60 @@ nginx-reload: nginx-config  ## Hot-reload nginx (re-reads ca.crl + CN allowlist)
 
 stack: server nginx-start  ## Start FastAPI + nginx together (client hits :8444)
 	$(call INFO,stack up — client -> https://127.0.0.1:8444 -> http://127.0.0.1:8443)
+
+# --- Apache (v1.3) ----------------------------------------------------------
+
+apache-check:  ## Generate apache-test.conf + run apachectl -t (v1.3)
+	$(call INFO,generating $(APACHE_CONF) from apache/apache.conf)
+	@./apache/apache-test-gen.sh >/dev/null
+	$(call INFO,validating with apachectl -t)
+	@apachectl -t -f "$$(pwd)/$(APACHE_CONF)" -d "$(APACHE_DIR_ABS)" 2>&1 | sed 's/^/    /'
+
+apache-start: apache-check  ## Start Apache on :8445 (mTLS + RewriteMap CN allowlist)
+	@if [[ -f $(APACHE_PID) ]] && kill -0 "$$(cat $(APACHE_PID))" 2>/dev/null; then \
+		printf '%b[make]%b apache already running (pid %s)\n' \
+			"$(C_YELLOW)" "$(C_RESET)" "$$(cat $(APACHE_PID))"; \
+		exit 0; \
+	fi
+	$(call INFO,starting Apache in background -> $(APACHE_LOG))
+	@apachectl -f "$$(pwd)/$(APACHE_CONF)" -d "$(APACHE_DIR_ABS)" -k start > $(APACHE_LOG) 2>&1
+	@for _ in 1 2 3 4 5; do \
+		if [[ -f $(APACHE_PID) ]]; then \
+			printf '%b[make]%b apache ready on https://127.0.0.1:8445 (mTLS + RewriteMap)\n' \
+				"$(C_GREEN)" "$(C_RESET)"; \
+			exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	printf '%b[make]%b apache did not come up; check $(APACHE_LOG) and apache/logs/error.log\n' \
+		"$(C_RED)" "$(C_RESET)" >&2; \
+	exit 1
+
+apache-stop:  ## Stop Apache
+	@if [[ -f $(APACHE_PID) ]]; then \
+		printf '%b[make]%b stopping apache (pid %s)\n' "$(C_GREEN)" "$(C_RESET)" "$$(cat $(APACHE_PID))"; \
+		apachectl -f "$$(pwd)/$(APACHE_CONF)" -d "$(APACHE_DIR_ABS)" -k stop 2>/dev/null || \
+			kill "$$(cat $(APACHE_PID))" 2>/dev/null || true; \
+		rm -f $(APACHE_PID); \
+	else \
+		printf '%b[make]%b apache not running\n' "$(C_YELLOW)" "$(C_RESET)"; \
+	fi
+
+apache-reload: apache-check  ## Hot-reload Apache (re-reads cn_allowlist.txt + ca.crl)
+	@if [[ ! -f $(APACHE_PID) ]]; then \
+		printf '%b[make]%b apache not running; use `make apache-start`\n' \
+			"$(C_RED)" "$(C_RESET)" >&2; \
+		exit 1; \
+	fi
+	$(call INFO,sending USR1 (graceful) to apache)
+	@apachectl -f "$$(pwd)/$(APACHE_CONF)" -d "$(APACHE_DIR_ABS)" -k graceful
+
+apache-server: server apache-start  ## Start FastAPI + Apache together
+	$(call INFO,apache stack up — client -> https://127.0.0.1:8445 -> http://127.0.0.1:8443)
+
+apache-stop-all: apache-stop stop  ## Stop both Apache and FastAPI
+
+stack-apache: pki apache-server  ## One-shot: pki + FastAPI + Apache
 
 test:  ## Run the pytest test suite (unit + integration markers)
 	$(call INFO,pytest — unit + integration)
