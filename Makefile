@@ -44,7 +44,7 @@ endef
 # `make pki`, `make revoke`, `make renew`, and `make pin` all stay usable on
 # a clean clone that hasn't built its venv yet — they shell out to openssl /
 # bash / awk and never touch Python.
-VENV_REQUIRED_GOALS := server test test-unit test-integration test-cov test-all
+VENV_REQUIRED_GOALS := server test test-unit test-integration test-cov test-all bench stress load-test
 ifneq ($(filter $(VENV_REQUIRED_GOALS),$(MAKECMDGOALS)),)
 ifeq (,$(wildcard $(PY)))
 $(error Python venv not found at '$(VENV)/'. Run: python -m venv venv && source venv/bin/activate && pip install -r requirements-dev.txt)
@@ -52,7 +52,7 @@ endif
 endif
 
 # --- Phony declarations -----------------------------------------------------
-.PHONY: help pki server stop test test-unit test-integration test-cov test-all revoke renew pin clean
+.PHONY: help pki server stop test test-unit test-integration test-cov test-all bench stress load-test revoke renew pin clean
 
 # Default target is `help` so a bare `make` tells you what's available.
 .DEFAULT_GOAL := help
@@ -130,9 +130,9 @@ test-unit:  ## Run only pytest unit tests (no network, no subprocess)
 	$(call INFO,pytest -m unit)
 	@$(PY) -m pytest -m unit
 
-test-integration:  ## Run only pytest integration tests (starts server subprocess)
-	$(call INFO,pytest -m integration)
-	@$(PY) -m pytest -m integration
+test-integration:  ## Run pytest integration tests (excludes @slow — those live under `make stress`)
+	$(call INFO,pytest -m "integration and not slow")
+	@$(PY) -m pytest -m "integration and not slow"
 
 test-cov:  ## Run full pytest with coverage (HTML at htmlcov/, threshold in .coveragerc)
 	$(call INFO,pytest --cov — branch coverage, fail_under=70)
@@ -144,6 +144,31 @@ test-cov:  ## Run full pytest with coverage (HTML at htmlcov/, threshold in .cov
 test-all:  ## Run unit tests then integration tests (sequential, distinct markers)
 	@$(MAKE) --no-print-directory test-unit
 	@$(MAKE) --no-print-directory test-integration
+
+bench:  ## Run the pytest-benchmark perf suite (T4 Part 1)
+	$(call INFO,pytest -m performance — 5 benchmarks, 100 rounds each)
+	@$(PY) -m pytest -m performance \
+		--benchmark-json=.benchmarks/latest.json \
+		--benchmark-autosave
+	$(call INFO,benchmark JSON -> .benchmarks/latest.json)
+
+stress:  ## Run the concurrency + stability slow-marker suite (T4 Parts 3/4)
+	$(call INFO,pytest -m slow — concurrency + stability)
+	@$(PY) -m pytest -m slow \
+		tests/test_concurrency.py tests/test_stability.py
+
+load-test:  ## Run locust for 30s with 20 users; enforce p95/p99/failure-rate SLO
+	$(call INFO,locust — 20 users / 5 rps spawn / 30s run)
+	@if ! $(PY) -c "import locust" 2>/dev/null; then \
+		printf '%b[make]%b locust not installed — pip install -r requirements-dev.txt\n' \
+			"$(C_RED)" "$(C_RESET)" >&2; \
+		exit 1; \
+	fi
+	@$(VENV)/bin/locust -f tests/locustfile.py --headless \
+		-u 20 --spawn-rate 5 --run-time 30s \
+		--host https://127.0.0.1:8443 \
+		--exit-code-on-error 1
+	$(call INFO,load test passed — see stdout table for latency percentiles)
 
 revoke:  ## Revoke client-01 and regenerate the CRL (server restart needed after)
 	$(call INFO,revoking pki/client/client.crt)
