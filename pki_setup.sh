@@ -21,6 +21,7 @@ PKI_DIR="${SCRIPT_DIR}/pki"
 CA_DIR="${PKI_DIR}/ca"
 SERVER_DIR="${PKI_DIR}/server"
 CLIENT_DIR="${PKI_DIR}/client"
+NGINX_DIR="${PKI_DIR}/nginx"
 CNF="${PKI_DIR}/openssl.cnf"
 
 CA_KEY="${CA_DIR}/ca.key"
@@ -34,6 +35,14 @@ SRV_CRT="${SERVER_DIR}/server.crt"
 CLI_KEY="${CLIENT_DIR}/client.key"
 CLI_CSR="${CLIENT_DIR}/client.csr"
 CLI_CRT="${CLIENT_DIR}/client.crt"
+
+# v1.2 — nginx termination cert. nginx now owns the public TLS surface;
+# the old server.{key,crt} above are still generated for backward-compat
+# tooling (pinned_client.py, make pin) but FastAPI itself no longer
+# serves TLS.
+NGX_KEY="${NGINX_DIR}/nginx.key"
+NGX_CSR="${NGINX_DIR}/nginx.csr"
+NGX_CRT="${NGINX_DIR}/nginx.crt"
 
 # Phase-5 CA database state (needed by `openssl ca` for CRL management).
 CA_INDEX="${CA_DIR}/index.txt"
@@ -58,11 +67,25 @@ warn() { printf '%s[WARN]%s %s\n' "${YELLOW}" "${NC}" "$*" >&2; }
 fail() { printf '%s[FAIL]%s %s\n' "${RED}"   "${NC}" "$*" >&2; exit 1; }
 
 # --- Preflight --------------------------------------------------------------
+# v1.2 — OpenSSL 1.1.1 is the hard floor because Ed25519 signing was
+# added there (1.1.0 has the keytype but not `-key -algorithm ed25519`
+# via `openssl req -x509`). Anything older silently produces an RSA
+# cert or outright fails with "unknown option". We refuse to continue.
 require_openssl() {
     command -v openssl >/dev/null 2>&1 || fail "openssl not found in PATH"
-    local major
-    major="$(openssl version | awk '{print $2}' | cut -d. -f1)"
-    [[ "${major}" -ge 3 ]] || warn "OpenSSL 3.x recommended (found: $(openssl version))"
+    local version_line major minor patch
+    version_line="$(openssl version | awk '{print $2}')"
+    major="$(echo "${version_line}" | cut -d. -f1)"
+    minor="$(echo "${version_line}" | cut -d. -f2)"
+    patch="$(echo "${version_line}" | cut -d. -f3 | sed 's/[^0-9].*//')"
+    : "${major:=0}" "${minor:=0}" "${patch:=0}"
+    if (( major < 1 )) || (( major == 1 && minor < 1 )) \
+            || (( major == 1 && minor == 1 && patch < 1 )); then
+        fail "OpenSSL >= 1.1.1 required for Ed25519 (found: $(openssl version))"
+    fi
+    if (( major < 3 )); then
+        warn "OpenSSL 3.x recommended (found: $(openssl version))"
+    fi
 }
 
 FORCE=0
@@ -77,13 +100,14 @@ esac
 
 require_openssl
 [[ -f "${CNF}" ]] || fail "Missing OpenSSL config: ${CNF}"
-mkdir -p "${CA_DIR}" "${SERVER_DIR}" "${CLIENT_DIR}"
+mkdir -p "${CA_DIR}" "${SERVER_DIR}" "${CLIENT_DIR}" "${NGINX_DIR}"
 
 if [[ ${FORCE} -eq 1 ]]; then
     warn "--force: removing existing keys, CSRs, certs, CRL, and CA database"
     rm -f "${CA_KEY}" "${CA_CRT}" "${CA_SRL}" "${CA_CRL}"
     rm -f "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}"
     rm -f "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}"
+    rm -f "${NGX_KEY}" "${NGX_CSR}" "${NGX_CRT}"
     # server.fingerprint is derived from server.crt and becomes stale the
     # instant we regenerate; pinned_client.py would then fail with a
     # mismatch until `make pin` is re-run. `make clean` already removes it;
@@ -244,15 +268,19 @@ fi
 
 gen_leaf "server" "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}" \
     "/CN=server/O=Lab/C=MY" "v3_server"
+gen_leaf "nginx" "${NGX_KEY}" "${NGX_CSR}" "${NGX_CRT}" \
+    "/CN=nginx-proxy/O=Lab/C=MY" "v3_nginx"
 gen_leaf "client" "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}" \
     "/CN=client-01/O=Lab/C=MY" "v3_client"
 
 printf '\n'
 verify_chain "server" "${SRV_CRT}"
+verify_chain "nginx"  "${NGX_CRT}"
 verify_chain "client" "${CLI_CRT}"
 
 print_cert_info "CA"     "${CA_CRT}"
 print_cert_info "Server" "${SRV_CRT}"
+print_cert_info "Nginx"  "${NGX_CRT}"
 print_cert_info "Client" "${CLI_CRT}"
 
 printf '\n%s%sPKI setup complete.%s\n' "${BOLD}" "${GREEN}" "${NC}"
