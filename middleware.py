@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from config import ALLOWED_CLIENT_CNS
+from config import ALLOWED_CLIENT_CNS, TRUSTED_PROXY_IPS
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,33 @@ def extract_cn_from_cert(peer_cert: dict[str, Any] | None) -> str | None:
             # Malformed RDN — fail closed by skipping, keep scanning.
             continue
     return None
+
+
+def extract_cn_from_headers(request: Request) -> str | None:
+    """Return the CN forwarded by a trusted nginx proxy, or None.
+
+    NGINX_MODE counterpart to ``extract_cn_from_cert``. Used when
+    nginx terminates mTLS on :443 and forwards the peer-cert fields
+    as HTTP headers to FastAPI on 127.0.0.1:8443 (plain HTTP).
+
+    SECURITY (SI-1): the ``X-Client-CN`` header is trusted ONLY when
+    the request's source IP is in ``config.TRUSTED_PROXY_IPS``. Any
+    caller reaching this port directly from a non-proxy IP could
+    otherwise forge the header and bypass auth entirely.
+
+    Returns None if the IP check fails, the header is absent, or
+    anything is off. The caller treats a None return as "no valid
+    client identity" and responds with 403.
+    """
+    client_ip = request.client.host if request.client else "-"
+    if client_ip not in TRUSTED_PROXY_IPS:
+        logger.warning(
+            "untrusted_proxy_cn_header_blocked mode=nginx client_ip=%s",
+            client_ip,
+        )
+        return None
+
+    return request.headers.get("X-Client-CN") or None
 
 
 def subject_fingerprint(peer_cert: dict[str, Any] | None) -> str:
