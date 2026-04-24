@@ -22,6 +22,7 @@ CA_DIR="${PKI_DIR}/ca"
 SERVER_DIR="${PKI_DIR}/server"
 CLIENT_DIR="${PKI_DIR}/client"
 NGINX_DIR="${PKI_DIR}/nginx"
+APACHE_DIR="${PKI_DIR}/apache"
 CNF="${PKI_DIR}/openssl.cnf"
 
 CA_KEY="${CA_DIR}/ca.key"
@@ -43,6 +44,15 @@ CLI_CRT="${CLIENT_DIR}/client.crt"
 NGX_KEY="${NGINX_DIR}/nginx.key"
 NGX_CSR="${NGINX_DIR}/nginx.csr"
 NGX_CRT="${NGINX_DIR}/nginx.crt"
+
+# v1.3 — Apache httpd termination cert. Same role as nginx.crt, used
+# by the parallel Apache integration. Apache mod_ssl supports ED25519
+# natively (since 2.4.41). chmod 640 (not 600) on the key so the
+# www-data worker user can read it under the Ubuntu/Debian default
+# permissions model.
+APACHE_KEY="${APACHE_DIR}/apache.key"
+APACHE_CSR="${APACHE_DIR}/apache.csr"
+APACHE_CRT="${APACHE_DIR}/apache.crt"
 
 # Phase-5 CA database state (needed by `openssl ca` for CRL management).
 CA_INDEX="${CA_DIR}/index.txt"
@@ -100,7 +110,7 @@ esac
 
 require_openssl
 [[ -f "${CNF}" ]] || fail "Missing OpenSSL config: ${CNF}"
-mkdir -p "${CA_DIR}" "${SERVER_DIR}" "${CLIENT_DIR}" "${NGINX_DIR}"
+mkdir -p "${CA_DIR}" "${SERVER_DIR}" "${CLIENT_DIR}" "${NGINX_DIR}" "${APACHE_DIR}"
 
 if [[ ${FORCE} -eq 1 ]]; then
     warn "--force: removing existing keys, CSRs, certs, CRL, and CA database"
@@ -108,6 +118,7 @@ if [[ ${FORCE} -eq 1 ]]; then
     rm -f "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}"
     rm -f "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}"
     rm -f "${NGX_KEY}" "${NGX_CSR}" "${NGX_CRT}"
+    rm -f "${APACHE_KEY}" "${APACHE_CSR}" "${APACHE_CRT}"
     # server.fingerprint is derived from server.crt and becomes stale the
     # instant we regenerate; pinned_client.py would then fail with a
     # mismatch until `make pin` is re-run. `make clean` already removes it;
@@ -270,17 +281,25 @@ gen_leaf "server" "${SRV_KEY}" "${SRV_CSR}" "${SRV_CRT}" \
     "/CN=server/O=Lab/C=MY" "v3_server"
 gen_leaf "nginx" "${NGX_KEY}" "${NGX_CSR}" "${NGX_CRT}" \
     "/CN=nginx-proxy/O=Lab/C=MY" "v3_nginx"
+gen_leaf "apache" "${APACHE_KEY}" "${APACHE_CSR}" "${APACHE_CRT}" \
+    "/CN=apache-proxy/O=Lab/C=MY" "v3_apache"
 gen_leaf "client" "${CLI_KEY}" "${CLI_CSR}" "${CLI_CRT}" \
     "/CN=client-01/O=Lab/C=MY" "v3_client"
+
+# Apache's worker (www-data on Ubuntu/Debian) needs *group* read access
+# to the private key. Override gen_leaf's default chmod 600.
+chmod 640 "${APACHE_KEY}"
 
 printf '\n'
 verify_chain "server" "${SRV_CRT}"
 verify_chain "nginx"  "${NGX_CRT}"
+verify_chain "apache" "${APACHE_CRT}"
 verify_chain "client" "${CLI_CRT}"
 
 print_cert_info "CA"     "${CA_CRT}"
 print_cert_info "Server" "${SRV_CRT}"
 print_cert_info "Nginx"  "${NGX_CRT}"
+print_cert_info "Apache" "${APACHE_CRT}"
 print_cert_info "Client" "${CLI_CRT}"
 
 printf '\n%s%sPKI setup complete.%s\n' "${BOLD}" "${GREEN}" "${NC}"
