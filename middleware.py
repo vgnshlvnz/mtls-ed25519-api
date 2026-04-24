@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from config import ALLOWED_CLIENT_CNS, TRUSTED_PROXY_IPS
+from config import ALLOWED_CLIENT_CNS, NGINX_MODE, TRUSTED_PROXY_IPS
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,26 @@ def extract_cn_from_headers(request: Request) -> str | None:
     return cn
 
 
+def resolve_client_cn(
+    request: Request,
+    peer_cert: dict[str, Any] | None,
+) -> str | None:
+    """Dispatch to the right CN extractor based on ``NGINX_MODE``.
+
+    - ``NGINX_MODE=true``  → trust nginx-forwarded headers (gated by
+       IP / X-Client-Verify / sanitisation in ``extract_cn_from_headers``).
+    - ``NGINX_MODE=false`` → parse the cert dict handed up by the
+       stdlib ``ssl`` module (the v1.0 direct-mTLS path).
+
+    Module-level constant ``NGINX_MODE`` is read from the config
+    module — tests monkeypatch ``middleware.NGINX_MODE`` directly to
+    exercise both branches.
+    """
+    if NGINX_MODE:
+        return extract_cn_from_headers(request)
+    return extract_cn_from_cert(peer_cert)
+
+
 def subject_fingerprint(peer_cert: dict[str, Any] | None) -> str:
     """Short SHA-256 of the Subject DN — safe to log, stable across runs."""
     if not peer_cert:
@@ -176,7 +196,7 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
         peer_cert: dict[str, Any] | None = (
             request.scope.get("extensions", {}).get("tls", {}).get("peer_cert")
         )
-        client_cn = extract_cn_from_cert(peer_cert)
+        client_cn = resolve_client_cn(request, peer_cert)
         fingerprint = subject_fingerprint(peer_cert)
         peer_addr = request.client.host if request.client else "-"
 
@@ -245,5 +265,7 @@ class ClientIdentityMiddleware(BaseHTTPMiddleware):
 __all__ = [
     "ClientIdentityMiddleware",
     "extract_cn_from_cert",
+    "extract_cn_from_headers",
+    "resolve_client_cn",
     "subject_fingerprint",
 ]
