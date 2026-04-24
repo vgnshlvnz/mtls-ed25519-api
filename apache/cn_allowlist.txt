@@ -1,0 +1,17 @@
+# Apache RewriteMap allowlist for the v1.3 architecture.
+#
+# Format: <CN><TAB><value>  — one entry per line. The value field is
+# arbitrary (we use 1 by convention; only the presence of the key
+# matters to the RewriteCond check in apache.conf).
+#
+# After editing this file:  apachectl -k graceful
+# Apache RewriteMap txt: caches per-worker; graceful spawns new
+# workers with the new file. Existing connections continue to use
+# the previous allowlist until they close — see
+# docs/apache_vs_nginx_behaviour.md for the multi-process drain
+# nuance and how the AC5 test handles it.
+#
+# Lines starting with '#' are comments. Blank lines are ignored.
+
+client-01	1
+client-02	1
