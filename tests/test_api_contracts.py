@@ -54,13 +54,23 @@ def test_H1_health_schema_has_exactly_the_documented_keys(
     session: requests.Session,
     server_process: dict[str, object],
 ) -> None:
-    """H1. Schema lock — /health returns exactly {status, tls, version}."""
+    """H1. Schema lock — /health returns exactly the documented key set.
+
+    T3 shipped {status, tls, version}; T7 added three observability
+    fields (uptime_seconds, cert_expires_in_days, crl_age_seconds).
+    """
     body = session.get(f"{_base_url(server_process)}/health", timeout=5).json()
-    assert set(body.keys()) == {
+    expected = {
         "status",
         "tls",
         "version",
-    }, f"unexpected /health keys: {sorted(body.keys())}"
+        "uptime_seconds",
+        "cert_expires_in_days",
+        "crl_age_seconds",
+    }
+    assert (
+        set(body.keys()) == expected
+    ), f"unexpected /health keys: {sorted(body.keys())}"
 
 
 def test_H2_health_status_is_the_string_ok(
