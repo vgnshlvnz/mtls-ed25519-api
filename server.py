@@ -357,6 +357,11 @@ def main() -> None:
         log_config=None,
         access_log=False,
         lifespan="off",
+        # SECURITY: suppress the default ``server: uvicorn`` and
+        # ``date:`` headers. Leaking the server product + version
+        # helps attackers fingerprint patch levels (T6 ID1).
+        server_header=False,
+        date_header=False,
     )
     config.load()
     # SECURITY: replace uvicorn's implicitly-built SSLContext with the one
