@@ -50,6 +50,9 @@ _SERVER_READY_POLL_S = 0.25
 # by pkill-ing prior processes in the nginx_stack fixture.
 UPSTREAM_PORT = 8443
 NGINX_PORT = 8444
+# v1.3 Apache test rig — apache-test-gen.sh substitutes 8445/8082.
+APACHE_HTTPS_PORT = 8445
+APACHE_HTTP_PORT = 8082
 
 
 # --- PKI discovery ----------------------------------------------------------
@@ -462,6 +465,21 @@ def _has_nginx() -> bool:
     return subprocess.run(["which", "nginx"], capture_output=True).returncode == 0
 
 
+def _has_apache() -> bool:
+    return subprocess.run(["which", "apachectl"], capture_output=True).returncode == 0
+
+
+def _kill_stray_apache() -> None:
+    """Stop any stale apache master/worker. Best-effort.
+
+    Same pattern as _kill_stray_nginx — pgrep -x against the short
+    binary name to avoid the self-kill trap (apache2's full cmdline
+    contains paths that include test filenames during a pytest run).
+    """
+    _kill_pids_by_name("apache2", exact=True)
+    time.sleep(0.3)
+
+
 # --- Session-scoped helper-cert kit ---------------------------------------
 
 
@@ -613,3 +631,153 @@ def nginx_stack(
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+
+
+# --- Session-scoped FastAPI + Apache stack (v1.3) -------------------------
+
+
+@pytest.fixture(scope="session")
+def apache_stack(
+    pki_paths: dict[str, Path],
+    cert_kit: dict[str, tuple[Path, Path]],
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[dict[str, object]]:
+    """Bring up FastAPI (plain) + Apache (mTLS + RewriteMap allowlist).
+
+    Same shape as nginx_stack but driving Apache 2.4 + mod_ssl on
+    port APACHE_HTTPS_PORT (8445). Skips cleanly if apachectl isn't
+    on PATH so this fixture doesn't break local runs without Apache
+    installed — install with `sudo apt install apache2`.
+
+    Apache uses ``apachectl -k start`` (not -g 'daemon off;') because
+    Apache's daemon mode is the default for `apachectl start`. The
+    PID is in apache/logs/apache.pid; teardown calls
+    ``apachectl -k stop`` and falls back to SIGKILL on the master pid.
+    """
+    if not _has_apache():
+        pytest.skip("apachectl not on PATH — skipping v1.3 Apache tests")
+
+    _kill_stray_uvicorn()
+    _kill_stray_apache()
+    _kill_stray_nginx()  # in case a v1.2 fixture is dangling
+
+    # Regenerate apache-test.conf so paths reflect the current
+    # PROJECT_ROOT and the cn_allowlist.txt path is absolute.
+    gen_sh = REPO_ROOT / "apache" / "apache-test-gen.sh"
+    subprocess.run([str(gen_sh)], check=True, capture_output=True)
+    apache_conf = REPO_ROOT / "apache" / "apache-test.conf"
+    apache_dir = REPO_ROOT / "apache"
+    apache_pid = apache_dir / "logs" / "apache.pid"
+    apache_access_log = apache_dir / "logs" / "access.log"
+    apache_error_log = apache_dir / "logs" / "error.log"
+
+    # Scrub the access log between sessions.
+    if apache_access_log.exists():
+        apache_access_log.write_text("")
+
+    # --- FastAPI upstream ---------------------------------------------------
+    log_dir = tmp_path_factory.mktemp("logs")
+    fastapi_log = log_dir / "fastapi.log"
+    env = os.environ.copy()
+    env["MTLS_API_PORT"] = str(UPSTREAM_PORT)
+    if "coverage" in sys.modules and (REPO_ROOT / ".coveragerc").is_file():
+        env["COVERAGE_PROCESS_START"] = str(REPO_ROOT / ".coveragerc")
+
+    fastapi_proc = subprocess.Popen(
+        [sys.executable, "server.py"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdout=fastapi_log.open("w"),
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_plain_health(
+            f"http://127.0.0.1:{UPSTREAM_PORT}",
+            time.monotonic() + _SERVER_READY_TIMEOUT_S,
+        )
+    except Exception:
+        fastapi_proc.terminate()
+        fastapi_proc.wait(timeout=5)
+        pytest.fail(
+            f"FastAPI did not start on :{UPSTREAM_PORT}\n"
+            f"log: {fastapi_log.read_text(errors='replace')}"
+        )
+
+    # --- Apache --------------------------------------------------------------
+    # apachectl forks and detaches; the parent exits when apache is up
+    # (or fails). We don't keep its Popen handle around because the
+    # actual apache master pid lives in apache/logs/apache.pid.
+    start_proc = subprocess.run(
+        [
+            "apachectl",
+            "-f",
+            str(apache_conf),
+            "-d",
+            str(apache_dir),
+            "-k",
+            "start",
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if start_proc.returncode != 0:
+        fastapi_proc.terminate()
+        fastapi_proc.wait(timeout=5)
+        pytest.fail(
+            f"apachectl start failed: rc={start_proc.returncode}\n"
+            f"stdout:\n{start_proc.stdout}\n"
+            f"stderr:\n{start_proc.stderr}\n"
+            f"error.log:\n{apache_error_log.read_text(errors='replace') if apache_error_log.is_file() else '(missing)'}"
+        )
+
+    try:
+        _wait_for_mtls_health(
+            f"https://localhost:{APACHE_HTTPS_PORT}",
+            pki_paths["ca_cert"],
+            pki_paths["client_cert"],
+            pki_paths["client_key"],
+        )
+    except Exception:
+        subprocess.run(
+            ["apachectl", "-f", str(apache_conf), "-d", str(apache_dir), "-k", "stop"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+        )
+        fastapi_proc.terminate()
+        fastapi_proc.wait(timeout=5)
+        pytest.fail(
+            "Apache did not become ready\n"
+            f"error.log:\n{apache_error_log.read_text(errors='replace') if apache_error_log.is_file() else '(missing)'}\n"
+            f"FastAPI log:\n{fastapi_log.read_text(errors='replace')}"
+        )
+
+    yield {
+        "apache_url": f"https://localhost:{APACHE_HTTPS_PORT}",
+        "upstream_url": f"http://127.0.0.1:{UPSTREAM_PORT}",
+        "fastapi_log": fastapi_log,
+        "apache_access_log": apache_access_log,
+        "apache_error_log": apache_error_log,
+        "apache_conf": apache_conf,
+        "apache_dir": apache_dir,
+        "apache_pid": apache_pid,
+        "fastapi_proc": fastapi_proc,
+        "cn_allowlist": REPO_ROOT / "apache" / "cn_allowlist.txt",
+    }
+
+    # --- teardown: apachectl stop + SIGTERM FastAPI ------------------------
+    subprocess.run(
+        ["apachectl", "-f", str(apache_conf), "-d", str(apache_dir), "-k", "stop"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+    )
+    if fastapi_proc.poll() is None:
+        fastapi_proc.terminate()
+        try:
+            fastapi_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            fastapi_proc.kill()
+            fastapi_proc.wait(timeout=5)
+    # Belt and braces — kill any apache process the start fork left behind.
+    _kill_stray_apache()
