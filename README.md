@@ -1,189 +1,214 @@
 # mTLS REST API with ED25519
 
-A small FastAPI server that enforces mutual TLS using **ED25519** keys and a
-self-hosted CA, with a CN allowlist, CRL-based revocation, short-lived
-client certs, and stdlib-only cert pinning.
+A small FastAPI server behind an nginx reverse proxy that enforces
+mutual TLS using **ED25519** keys and a self-hosted CA. As of **v1.2**,
+nginx is the sole authentication boundary: it terminates mTLS, checks
+the CRL, and enforces a CN allowlist via a `map{}` block. FastAPI is
+completely auth-blind — plain HTTP on 127.0.0.1:8443, no cert parsing,
+no header trust.
 
-The project is built as five incremental phases — each fully green on its
-own — so the progression from "PKI exists" through to "revocation works
-and the cert rotates every 24 hours" is easy to follow commit-by-commit.
+The project is built as incremental phases. The v1.0 baseline shipped
+FastAPI-direct mTLS. v1.1 introduced nginx as a co-enforcer (hybrid).
+v1.2 finished the migration and removed every line of FastAPI-side
+auth code — structural tests now fail CI if any of it reappears.
 
-## Quickstart (≤5 commands from a clean clone)
+## Quickstart (≤6 commands from a clean clone)
 
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements-dev.txt
-make pki                  # ED25519 CA + server + client + initial CRL
-make server               # FastAPI at https://127.0.0.1:8443, mTLS required
-make test                 # unit tests + curl matrix + requests + httpx
+make pki                  # ED25519 CA + server + nginx + client + initial CRL
+make stack                # FastAPI plain-HTTP :8443 + nginx mTLS :8444
+curl --cacert pki/ca/ca.crt \
+     --cert pki/client/client.crt \
+     --key  pki/client/client.key \
+     https://localhost:8444/health
+make test                 # 42 pytest cases, ~6-7s wall-clock
 ```
 
-`make stop` when you're done. `make help` lists every target. If any command
-above fails the very first time — you're not in a venv.
+`make nginx-stop && make stop` when you're done. `make help` lists
+every target. If any command above fails the very first time —
+you're not in a venv.
 
-## What the server enforces
+## What nginx enforces (the only auth in v1.2)
 
-Two independent gates, both must pass:
+Four independent gates, **all** must pass, **all** at nginx:
 
-1. **TLS handshake** (`tls.build_server_context`) — ED25519-only, stdlib
-   `ssl.SSLContext`, `CERT_REQUIRED`, TLS 1.2+. Any client that can't
-   present a cert chaining to `pki/ca/ca.crt` is rejected *before HTTP
-   bytes flow*. If a CRL is present, revoked certs die here too
-   (`VERIFY_CRL_CHECK_LEAF`).
-2. **CN allowlist** (`middleware.ClientIdentityMiddleware`) — the
-   Subject CommonName is looked up in `config.ALLOWED_CLIENT_CNS`.
-   Trusted cert + wrong CN → `403 {"error":"forbidden","cn":"...","reason":"cn_not_allowlisted"}`.
+1. **TLS handshake** — TLS 1.2+ floor, HIGH cipher list, cert chain
+   verified against `pki/ca/ca.crt` (`ssl_verify_client on`).
+2. **CRL check** — revoked certs produce HTTP 400 post-handshake
+   (`ssl_crl` points at `pki/ca/ca.crl`).
+3. **CN allowlist** — parsed out of the client Subject DN via one
+   `map{}` block, checked against a second `map{}` that is the
+   allowlist:
+   ```nginx
+   map $ssl_client_cn $cn_allowed {
+       default       0;
+       "client-01"   1;
+       "client-02"   1;
+   }
+   ```
+   Not on the list → nginx returns `403` with the canonical JSON
+   body (`{"error":"forbidden","cn":"...","reason":"cn_not_allowlisted"}`)
+   directly. FastAPI is never contacted.
+4. **Audit logging** — every request lands in the nginx access log
+   with `verify=<status>`, `cn="..."`, `allowed=0|1`, serial, and
+   status code.
 
-Every request carries an `X-Request-ID`; handshake failures emit a
-single WARNING log line with a coarse reason code (no cert detail).
+FastAPI only sees requests that have already passed every gate above.
+Hitting FastAPI directly with a spoofed `X-Client-CN` header changes
+nothing — the tests prove this (`test_server_plain.py::SP8`).
 
 ## Per-phase feature table
 
 | Phase | Feature | Key files |
 |-------|---------|-----------|
-| 1 | ED25519 CA + server + client certs, script-driven, chain-verified | `pki_setup.sh`, `pki/openssl.cnf` |
-| 2 | FastAPI server, mTLS SSLContext, `GET /health`, `GET /data`, `POST /data`, structured logs | `server.py`, `tls.py`, `requirements.txt` |
-| 3 | CN allowlist middleware, 403 on rejection, TLS-handshake failures logged, unit tests | `config.py`, `middleware.py`, `tests/test_middleware.py` |
-| 4 | curl matrix (6 scenarios), `requests.Session` client, async `httpx` client, TLS-negative tests | `tests/curl_tests.sh`, `tests/negative_tests.sh`, `tests/client_test.py`, `tests/client_async.py` |
-| 5 | CRL init + revocation, 24h short-lived cert rotation, SHA-256 cert pinning, Makefile, OCSP notes | `tests/revoke_client.sh`, `renew_client_cert.sh`, `pinned_client.py`, `Makefile`, `docs/ocsp_notes.md` |
+| v1.0 | ED25519 CA + FastAPI mTLS + CN allowlist middleware + 24h client cert rotation + pinning | `pki_setup.sh`, `server.py` (v1.0), `middleware.py`, `tests/test_middleware.py` *(all deleted in v1.2)* |
+| v1.1 | nginx termination with FastAPI co-enforcement; header-trust middleware guarded by trusted-proxy-IP list | `nginx/nginx.conf` (hybrid), `middleware.py` (NGINX_MODE branch) *(replaced in v1.2)* |
+| v1.2 | nginx-only auth (CN allowlist in `map{}`); FastAPI is auth-blind plain HTTP; structural tests enforce the invariant in CI | `nginx/nginx.conf`, `server.py`, `config.py`, `tests/test_v12_structural.py`, `.github/workflows/nginx-ci.yml` |
 
-Every phase lives on its own `feature/phase-X-<name>` branch and adds
-independent commits on top — `git log --oneline` reads as a progression.
+The v1.2 wiki page at
+[`docs/wiki_v1_2_nginx_only_auth.md`](docs/wiki_v1_2_nginx_only_auth.md)
+walks through the architecture shift in detail.
 
-## Security invariants (audited in code)
+## Security invariants (v1.2, enforced by CI)
 
-* ED25519 keys only. No RSA, no ECDSA — checked via `openssl` output and
-  by project rules.
-* `ssl.CERT_REQUIRED` is the only accepted verify mode. `CERT_NONE` /
-  `CERT_OPTIONAL` / `verify=False` are banned everywhere (tests included).
-* `PROTOCOL_TLS_SERVER` and `TLSVersion.TLSv1_2` minimum on the server
-  side. Uvicorn's auto-built SSLContext is explicitly *replaced* with
-  the audited one from `tls.build_server_context()`.
-* Private keys live only in `pki/**/*.key` and are `chmod 600`. Git blocks
-  them two ways — `.gitignore` and a pre-commit hook that greps PEM
-  private-key headers.
-* Handshake failures are logged with a reason classifier only (never the
-  exception detail), so a misbehaving peer can't probe our trust store
-  via log diffing.
-* Cert pinning (`pinned_client.py`) hashes the raw DER bytes — never the
-  parsed `getpeercert()` dict, which is a lossy representation.
+* ED25519 keys only. No RSA, no ECDSA.
+* nginx enforces TLS 1.2+ minimum, HIGH cipher list, `server_tokens off`.
+* `ssl_verify_client on` + `ssl_crl` for revocation. Revoked / expired
+  / self-signed certs all produce HTTP 400 at nginx.
+* The CN allowlist lives **only** in `nginx/nginx.conf`'s `map{}` block.
+  `config.py` intentionally declares no allowlist — ST2 fails CI if
+  one reappears.
+* `server.py` contains **no** TLS primitives, **no** peer-cert parsing,
+  **no** `X-Client-*` header references — ST3 fails CI on any of 22
+  forbidden tokens. Even comments/docstrings mentioning those names
+  fail the check (the scan is deliberately literal).
+* `middleware.py` and `tls.py` are deleted — ST1 fails CI if either
+  reappears.
+* Private keys live only in `pki/**/*.key`, `chmod 600`, blocked from
+  git by both `.gitignore` and a pre-commit grep.
 
 ## Running the test suite
 
-The Python test surface is driven by **pytest** with two primary
-layers, selectable by marker:
-
-| Marker | What runs | Typical time |
-|--------|-----------|--------------|
-| `unit` | Pure-function tests in `tests/test_middleware.py`. No sockets, no subprocess. | < 1s |
-| `integration` | Starts a real `server.py` subprocess behind mTLS (session-scoped fixture) and hits every endpoint with `requests.Session` and `httpx.AsyncClient`. | ~5s cold |
-
-Common invocations (all via the Makefile, or `pytest` directly):
-
 ```bash
-make test-unit            # fast unit layer
-make test-integration     # live server + real mTLS
-make test-all             # both, sequentially
-make test-cov             # full pytest with branch coverage (fail_under=70)
-make test                 # pytest + legacy curl matrix + negative tests
+make test                 # pytest — 42 tests, ~6-7s
+make test-unit            # only unit-marker tests (ST + fast stuff)
+make test-integration     # only integration-marker (nginx + FastAPI subprocess)
+make test-cov             # full pytest with branch coverage (HTML: htmlcov/)
 ```
 
-Additional markers — `slow`, `security`, `performance`, `e2e` — are
-registered in `pytest.ini` and populated by later test-expansion phases
-(T2 onward). Run a single marker with `pytest -m <marker>`; combine
-markers with boolean expressions (`pytest -m "unit and not slow"`).
+Marker breakdown (from `pytest.ini`):
 
-Coverage is configured in `.coveragerc`:
+| Marker | Count | What runs |
+|--------|-------|-----------|
+| `unit` | 4 | `test_v12_structural.py` — source inspection only. < 1s. |
+| `integration` | 35 | real FastAPI + real nginx subprocesses + real mTLS |
+| `performance` | 6 | `test_nginx_perf.py` (NP1-NP3) + `test_nginx_concurrency.py` (NC1-NC3) |
+| `security` | 5 | cross-cut marker on ST1-ST3 + LA1 + SP8 |
+| `slow` | 3 | NP1-NP3 benchmarks |
 
-* Scope: `server.py`, `middleware.py`, `tls.py`, `config.py` (the
-  server-side surface).
-* Branch coverage enabled; the T1 baseline floor is **70%**.
-  Each subsequent phase must hold or raise it.
-* HTML report at `htmlcov/index.html` after `make test-cov`.
+For load/SLO testing, use Locust directly:
 
-Server fixture behaviour — the integration suite will pick a random
-free loopback port via `MTLS_API_PORT` when 8443 is already bound,
-so tests are safe to run alongside a backgrounded `make server`.
+```bash
+make stack
+locust --locustfile tests/nginx_locustfile_v2.py \
+       --host https://localhost:8444 \
+       --users 50 --spawn-rate 10 --run-time 30s \
+       --headless --exit-code-on-error 1
+```
+
+The Locust run fails with non-zero exit if total-request p95 ≥ 30 ms.
 
 ## Day-2 operations
 
 | Task | How |
 |------|-----|
-| Rotate the client cert to a fresh 24h-lived one | `make renew` (cron: `0 */12 * * *` → `renew_client_cert.sh`) |
-| Revoke the current client cert and update the CRL | `make revoke` (then `make stop && make server` to apply) |
-| Extract the server's SHA-256 pin into `pki/server/server.fingerprint` | `make pin` |
-| Start a pinned-client demo run | `python pinned_client.py` (uses the file from `make pin`) |
-| Wipe everything except source | `make clean` |
+| Add/remove a CN from the allowlist | edit `nginx/nginx.conf`, then `make nginx-reload` |
+| Revoke the current client cert | `make revoke` then `make nginx-reload` |
+| Rotate client cert to fresh 24h-lived one | `make renew` |
+| Extract nginx cert SHA-256 pin | `make pin` → `pki/nginx/nginx.fingerprint` |
+| Hot-reload nginx without restart | `make nginx-reload` |
+| Full PKI regen | `make clean && make pki` |
 
 ## Non-obvious design choices
 
-Documented in-code with `# SECURITY:` comments — a few worth calling out
-at README level:
-
-* **Forced `loop="asyncio"`** in `server.py`. uvloop (bundled with
-  `uvicorn[standard]`) has its own C-level SSL implementation that
-  bypasses `asyncio.sslproto`, which is where the TLS-handshake-failure
-  logging hook lives. At our scale, perf loss is a rounding error;
-  visibility is not.
-* **Monkey-patch of `asyncio.sslproto.SSLProtocol._fatal_error`**.
-  stdlib silently swallows `SSLError` because `SSLError` inherits from
-  `OSError`. A minimal wrapper emits a single WARNING line with
-  `reason=PEER_DID_NOT_RETURN_A_CERTIFICATE` or similar before
-  delegating to the original close sequence. Failing fast on import if
-  the stdlib API moves in a future Python.
-* **Leaf signing via `openssl ca`, not `openssl x509 -req`**. The
-  former writes to `pki/ca/index.txt` so `openssl ca -revoke` can find
-  the cert by serial and flip it to R(evoked). Plain `x509 -req` does
-  not register, so a CRL flow would not work.
+* **ST3 is a literal-text match, not AST-aware.** It catches
+  forbidden token references in comments and docstrings too — by
+  design. If a comment says "TODO: re-enable ssl.SSLContext", that
+  comment is itself a signpost toward the wrong architecture and
+  should fail the build.
+* **Deny is faster than allow.** nginx short-circuits before dialling
+  the upstream for rejected requests. NP2 measures ~418µs for deny vs
+  ~832µs for allow on localhost — a measurable win from the
+  single-layer model.
+* **`openssl ca` for leaf signing, not `openssl x509 -req`.** The
+  former writes to `pki/ca/index.txt`, which `openssl ca -revoke`
+  needs to find the cert by serial and flip it to R(evoked). Plain
+  `x509 -req` does not register, so the CRL flow wouldn't work.
+* **Map-lookup is O(1), not O(n).** NP3 patches 1000 bench CNs into
+  the allowlist, reloads, and asserts latency stays within the
+  baseline ceiling. This is insurance against a future nginx version
+  changing its internal hash-table strategy.
 
 ## OCSP vs CRL
 
-Short version: this project uses CRL because the stdlib `ssl` module
-supports it natively and OCSP stapling would require PyOpenSSL
-(banned by project rules). Full trade-off analysis, plus a minimal
-OCSP responder recipe for local experimentation, is in
+Short version: this project uses CRL because nginx supports it
+natively via `ssl_crl`. OCSP stapling would add a stapling daemon
+without changing the trust model. Full trade-off analysis in
 [`docs/ocsp_notes.md`](docs/ocsp_notes.md).
 
 ## Directory layout
 
 ```
 .
-├── server.py              # FastAPI app, mTLS middleware wired in
-├── tls.py                 # SSLContext factory + cert-aware uvicorn protocol
-├── middleware.py          # ClientIdentityMiddleware (CN allowlist + 403)
-├── config.py              # ALLOWED_CLIENT_CNS
-├── pki_setup.sh           # Initial PKI bootstrap (Ed25519, 10y CA, 1y leaves)
-├── renew_client_cert.sh   # Rotate client cert to 24h-lived (cron target)
-├── pinned_client.py       # stdlib-only SHA-256 cert pinning demo
-├── Makefile               # Lifecycle automation (pki/server/test/revoke/renew/pin/clean)
-├── requirements.txt       # Runtime deps (fastapi/uvicorn/pydantic)
-├── requirements-dev.txt   # Test deps (+ requests, httpx)
+├── server.py                     # FastAPI app — plain HTTP, auth-blind (v1.2)
+├── config.py                     # Documentation stub — empty by design
+├── pki_setup.sh                  # ED25519 PKI: CA + server + nginx + client
+├── renew_client_cert.sh          # Rotate client cert to 24h-lived
+├── pinned_client.py              # stdlib SHA-256 cert pinning demo
+├── Makefile                      # Lifecycle: pki/server/nginx-*/stack/test/revoke/renew/pin/clean
+├── requirements.txt              # Runtime (fastapi, uvicorn, pydantic)
+├── requirements-dev.txt          # Test (+ pytest, requests, httpx, locust, pytest-benchmark)
+├── nginx/
+│   ├── nginx.conf                # Template w/ @@PROJECT_ROOT@@ placeholder + map{} allowlist
+│   ├── ssl_params.conf           # TLS 1.2+, HIGH cipher list, session cache
+│   └── nginx-test-gen.sh         # Renders template -> nginx-test.conf
 ├── pki/
-│   ├── openssl.cnf        # CA + v3_{ca,server,client} extensions + CA_default for `openssl ca`
-│   ├── ca/                # (gitignored) ca.key, ca.crt, ca.crl, index.txt, …
-│   ├── server/            # (gitignored) server.{key,crt}
-│   └── client/            # (gitignored) client.{key,crt}
+│   ├── openssl.cnf               # v3_{ca,server,nginx,client} extensions + CA_default
+│   ├── ca/                       # (gitignored) ca.key, ca.crt, ca.crl, index.txt, ...
+│   ├── server/                   # (gitignored) server.{key,crt} — legacy
+│   ├── nginx/                    # (gitignored) nginx.{key,crt} — the cert clients see
+│   └── client/                   # (gitignored) client.{key,crt}
 ├── tests/
-│   ├── curl_tests.sh      # 6-scenario curl matrix
-│   ├── negative_tests.sh  # TLS-layer negative assertions
-│   ├── revoke_client.sh   # `openssl ca -revoke` + CRL regen
-│   ├── client_test.py     # sync requests client
-│   ├── client_async.py    # async httpx client
-│   └── test_middleware.py # unittest stubs for cert parsing
-└── docs/
-    └── ocsp_notes.md      # CRL vs OCSP trade-offs
+│   ├── conftest.py               # Shared fixtures: pki_paths, plain_server, cert_kit, nginx_stack
+│   ├── test_nginx_auth.py        # N2v2: 22-test auth matrix + NC5 live-reload
+│   ├── test_server_plain.py      # N3v2: SP1-SP8 plain FastAPI + LA1 log discipline
+│   ├── test_v12_structural.py    # N3v2: ST1-ST3 — enforce v1.2 invariant in CI
+│   ├── test_nginx_perf.py        # N4v2: NP1-NP3 benchmarks
+│   ├── test_nginx_concurrency.py # N4v2: NC1-NC3 parallel allow/deny
+│   ├── nginx_locustfile_v2.py    # Locust scenario with p95 < 30ms SLO gate
+│   └── revoke_client.sh          # openssl ca -revoke + CRL regen
+├── docs/
+│   ├── nginx_architecture_v2.md  # In-tree v1.2 architecture doc
+│   ├── wiki_v1_2_nginx_only_auth.md  # Wiki body (paste to GitHub wiki)
+│   └── ocsp_notes.md             # CRL vs OCSP trade-offs
+└── .github/workflows/
+    └── nginx-ci.yml              # structural-check + config-lint + auth-tests jobs
 ```
 
 ## Requirements
 
-* Python 3.11+ (tested on 3.12)
-  — 3.11 is the floor because `server.py` uses `datetime.UTC` and
-  `asyncio.Runner`, both added in that release.
-* OpenSSL 3.x (tested on 3.0.13)
-* GNU make (macOS ships it as `/usr/bin/make`)
-* Bash 4+ (all scripts start with `set -euo pipefail`; `shellcheck` clean)
+* Python 3.11+ (tested on 3.12). 3.11 is the floor because
+  `server.py` uses `datetime.UTC`.
+* OpenSSL 1.1.1+ (tested on 3.0.13). 1.1.1 is the hard floor for
+  Ed25519 signing support — `pki_setup.sh` enforces this.
+* nginx 1.18+ (tested on 1.24). Needs support for the `map{}`
+  directive and variable substitution in `return`.
+* GNU make.
+* Bash 4+.
 
 ## License
 
-Private lab project — not yet open-sourced. Add a license file before
-external sharing.
+Private lab project — not yet open-sourced. Add a license file
+before external sharing.
