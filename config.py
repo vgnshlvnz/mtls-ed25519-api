@@ -1,21 +1,19 @@
-"""Runtime configuration for the mTLS REST API.
+"""Runtime configuration for the mTLS REST API (v1.2).
 
-Values here drive security decisions. Keep this file deliberately small,
-readable, and reviewable in a single glance — every entry is a promise
-that a specific identity is trusted.
+Intentionally empty.
+
+v1.2 architectural invariant: ALL client authentication and
+authorization lives in nginx (see ``nginx/nginx.conf`` — specifically
+the ``map $ssl_client_cn $cn_allowed`` allowlist and the
+``ssl_verify_client`` / ``ssl_crl`` directives). This process is
+auth-blind: it never parses peer certs, never consults an allowlist,
+and has no notion of "trusted proxy IPs".
+
+If you find yourself wanting to add an allowlist, a trusted-proxy-IP
+list, or an ``NGINX_MODE`` flag here, STOP — that was the v1.1 hybrid
+architecture that v1.2 was written to remove. Extend ``nginx.conf``
+instead; the structural test suite (``tests/test_v12_structural.py``)
+will fail CI if auth state reappears in this module.
 """
 
 from __future__ import annotations
-
-# Subject CommonNames that are admitted to the API once their certificate
-# chain has already been validated by the TLS layer.
-#
-# A client that passes the TLS handshake (i.e. holds a key whose cert
-# chains to pki/ca/ca.crt) but whose CN does NOT appear here is rejected
-# with HTTP 403. This is an application-layer authorization check *on top
-# of* TLS verification — "the CA says you are X, and we only talk to
-# specific Xs".
-#
-# frozenset chosen for O(1) membership checks and immutability at import
-# time, so a runtime bug cannot silently widen the allowlist.
-ALLOWED_CLIENT_CNS: frozenset[str] = frozenset({"client-01", "client-02"})

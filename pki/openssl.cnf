@@ -43,12 +43,25 @@ authorityKeyIdentifier = keyid, issuer
 
 # --- Client leaf ------------------------------------------------------------
 # clientAuth EKU is what the server checks during mTLS handshake.
-# No SAN: client identity is carried in the Subject CN (see allowlist logic,
-# Phase 3).
+# No SAN: client identity is carried in the Subject CN (see nginx.conf
+# map{} allowlist — v1.2 architecture).
 [v3_client]
 basicConstraints       = CA:FALSE
 keyUsage               = critical, digitalSignature
 extendedKeyUsage       = clientAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid, issuer
+
+# --- nginx termination leaf (v1.2) ------------------------------------------
+# Same shape as v3_server, separate section so the two certs have
+# independent lifecycles and the nginx key can be rotated without
+# touching the (now unused) FastAPI server key. SAN mirrors v3_server
+# because both terminate at 127.0.0.1/localhost during local tests.
+[v3_nginx]
+basicConstraints       = CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = serverAuth
+subjectAltName         = DNS:localhost, IP:127.0.0.1
 subjectKeyIdentifier   = hash
 authorityKeyIdentifier = keyid, issuer
 

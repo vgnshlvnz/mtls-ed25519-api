@@ -1,16 +1,19 @@
-# mTLS ED25519 API — project lifecycle automation.
+# mTLS ED25519 API — project lifecycle automation (v1.2).
 #
 # Tested on Linux (Ubuntu/Debian) with GNU make and on macOS with Homebrew
 # `make` (GNU). Apple's stock `/usr/bin/make` is GNU on modern macOS, so
 # `make <target>` should work out of the box there too.
 #
-# Quickstart — see README.md for the full walkthrough:
+# v1.2 architecture:
+#   make pki           -> CA + server + nginx + client certs
+#   make server        -> FastAPI on plain HTTP :8443 (auth-blind)
+#   make nginx-config  -> regenerate nginx-test.conf from the template
+#   make nginx-start   -> start nginx on :8444 (mTLS + CN allowlist)
+#   make stack         -> server + nginx together (client-facing :8444)
+#   make test          -> pytest (unit + integration markers)
+#   make stop          -> stop FastAPI + nginx
 #
-#   make help       # list targets
-#   make pki        # generate ED25519 CA + server + client certs
-#   make server     # start the mTLS server in the background
-#   make test       # run the full test matrix
-#   make stop       # stop the background server
+# See README.md for the full walkthrough.
 
 SHELL        := /usr/bin/env bash
 .SHELLFLAGS  := -euo pipefail -c
@@ -19,8 +22,11 @@ VENV         := venv
 PY           := $(VENV)/bin/python
 PIP          := $(VENV)/bin/pip
 
-PID_FILE     := .server.pid
-SERVER_LOG   := .server.log
+PID_FILE        := .server.pid
+SERVER_LOG      := .server.log
+NGINX_CONF      := nginx/nginx-test.conf
+NGINX_PID       := nginx/logs/nginx.pid
+NGINX_LOG       := .nginx.log
 
 # ANSI colour escapes. Quoted via printf '%b' in recipes so they don't
 # bleed into logs when stdout is not a TTY.
@@ -39,12 +45,7 @@ define WARN
 endef
 
 # --- Guards -----------------------------------------------------------------
-# Fail early when a target that actually uses Python is invoked without a
-# venv. Scoping by $(MAKECMDGOALS) so bare `make`, `make help`, `make clean`,
-# `make pki`, `make revoke`, `make renew`, and `make pin` all stay usable on
-# a clean clone that hasn't built its venv yet — they shell out to openssl /
-# bash / awk and never touch Python.
-VENV_REQUIRED_GOALS := server test test-unit test-integration test-cov test-all
+VENV_REQUIRED_GOALS := server test test-unit test-integration test-cov test-all stack
 ifneq ($(filter $(VENV_REQUIRED_GOALS),$(MAKECMDGOALS)),)
 ifeq (,$(wildcard $(PY)))
 $(error Python venv not found at '$(VENV)/'. Run: python -m venv venv && source venv/bin/activate && pip install -r requirements-dev.txt)
@@ -52,37 +53,34 @@ endif
 endif
 
 # --- Phony declarations -----------------------------------------------------
-.PHONY: help pki server stop test test-unit test-integration test-cov test-all revoke renew pin clean
+.PHONY: help pki server stop test test-unit test-integration test-cov test-all \
+        revoke renew pin clean \
+        nginx-config nginx-start nginx-stop nginx-reload stack
 
-# Default target is `help` so a bare `make` tells you what's available.
 .DEFAULT_GOAL := help
 
 # --- Targets ----------------------------------------------------------------
 
 help:  ## Show this help
 	@printf '%bmTLS ED25519 API — available targets:%b\n' "$(C_BOLD)" "$(C_RESET)"
-	@awk 'BEGIN {FS=":.*## "} /^[a-z][a-zA-Z_-]*:.*## / {printf "  %-10s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS=":.*## "} /^[a-z][a-zA-Z_-]*:.*## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-pki:  ## Generate or regenerate the full PKI (CA + server + client + CRL)
+pki:  ## Generate or regenerate the full PKI (CA + server + nginx + client + CRL)
 	$(call INFO,running pki_setup.sh)
 	@./pki_setup.sh
 	$(call INFO,pki ready)
 
-server:  ## Start the FastAPI server in the background (PID -> $(PID_FILE))
+server:  ## Start FastAPI plain-HTTP on :8443 (PID -> $(PID_FILE))
 	@if [[ -f $(PID_FILE) ]] && kill -0 "$$(cat $(PID_FILE))" 2>/dev/null; then \
 		printf '%b[make]%b server already running (pid %s)\n' \
 			"$(C_YELLOW)" "$(C_RESET)" "$$(cat $(PID_FILE))"; \
 		exit 0; \
 	fi
-	$(call INFO,starting server in background -> $(SERVER_LOG))
+	$(call INFO,starting FastAPI (plain HTTP) in background -> $(SERVER_LOG))
 	@$(PY) server.py > $(SERVER_LOG) 2>&1 & echo $$! > $(PID_FILE)
 	@for _ in 1 2 3 4 5 6 7 8 9 10; do \
-		if curl --silent --fail \
-				--cacert pki/ca/ca.crt \
-				--cert pki/client/client.crt \
-				--key pki/client/client.key \
-				https://localhost:8443/health >/dev/null 2>&1; then \
-			printf '%b[make]%b server ready on https://127.0.0.1:8443\n' \
+		if curl --silent --fail http://127.0.0.1:8443/health >/dev/null 2>&1; then \
+			printf '%b[make]%b FastAPI ready on http://127.0.0.1:8443 (auth-blind)\n' \
 				"$(C_GREEN)" "$(C_RESET)"; \
 			exit 0; \
 		fi; \
@@ -99,7 +97,7 @@ server:  ## Start the FastAPI server in the background (PID -> $(PID_FILE))
 	fi; \
 	exit 1
 
-stop:  ## Stop the background server (no-op if not running)
+stop:  ## Stop the background FastAPI server (no-op if not running)
 	@if [[ ! -f $(PID_FILE) ]]; then \
 		printf '%b[make]%b no $(PID_FILE); server not running\n' \
 			"$(C_YELLOW)" "$(C_RESET)"; \
@@ -118,13 +116,61 @@ stop:  ## Stop the background server (no-op if not running)
 		rm -f $(PID_FILE); \
 	fi
 
-test:  ## Run the full test suite (pytest unit + integration + curl matrix)
+nginx-config:  ## Regenerate nginx/nginx-test.conf from the tracked template
+	$(call INFO,generating $(NGINX_CONF) from nginx/nginx.conf)
+	@./nginx/nginx-test-gen.sh >/dev/null
+	$(call INFO,validating with nginx -t)
+	@nginx -t -c "$$(pwd)/$(NGINX_CONF)" 2>&1 | sed 's/^/    /'
+
+nginx-start: nginx-config  ## Start nginx on :8444 (mTLS + CN allowlist)
+	@if [[ -f $(NGINX_PID) ]] && kill -0 "$$(cat $(NGINX_PID))" 2>/dev/null; then \
+		printf '%b[make]%b nginx already running (pid %s)\n' \
+			"$(C_YELLOW)" "$(C_RESET)" "$$(cat $(NGINX_PID))"; \
+		exit 0; \
+	fi
+	$(call INFO,starting nginx in background -> $(NGINX_LOG))
+	@mkdir -p nginx/logs
+	@nginx -c "$$(pwd)/$(NGINX_CONF)" > $(NGINX_LOG) 2>&1 &
+	@for _ in 1 2 3 4 5; do \
+		if [[ -f $(NGINX_PID) ]]; then \
+			printf '%b[make]%b nginx ready on https://127.0.0.1:8444 (mTLS + CN allowlist)\n' \
+				"$(C_GREEN)" "$(C_RESET)"; \
+			exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	printf '%b[make]%b nginx did not come up; check $(NGINX_LOG)\n' \
+		"$(C_RED)" "$(C_RESET)" >&2; \
+	exit 1
+
+nginx-stop:  ## Stop the background nginx
+	@if [[ -f $(NGINX_PID) ]]; then \
+		pid=$$(cat $(NGINX_PID)); \
+		if kill -0 "$$pid" 2>/dev/null; then \
+			printf '%b[make]%b stopping nginx (pid %s)\n' \
+				"$(C_GREEN)" "$(C_RESET)" "$$pid"; \
+			nginx -s quit -c "$$(pwd)/$(NGINX_CONF)" 2>/dev/null || kill "$$pid" 2>/dev/null || true; \
+		fi; \
+		rm -f $(NGINX_PID); \
+	else \
+		printf '%b[make]%b nginx not running\n' "$(C_YELLOW)" "$(C_RESET)"; \
+	fi
+
+nginx-reload: nginx-config  ## Hot-reload nginx (re-reads ca.crl + CN allowlist)
+	@if [[ ! -f $(NGINX_PID) ]]; then \
+		printf '%b[make]%b nginx not running; use `make nginx-start`\n' \
+			"$(C_RED)" "$(C_RESET)" >&2; \
+		exit 1; \
+	fi
+	$(call INFO,sending SIGHUP to nginx)
+	@nginx -s reload -c "$$(pwd)/$(NGINX_CONF)"
+
+stack: server nginx-start  ## Start FastAPI + nginx together (client hits :8444)
+	$(call INFO,stack up — client -> https://127.0.0.1:8444 -> http://127.0.0.1:8443)
+
+test:  ## Run the pytest test suite (unit + integration markers)
 	$(call INFO,pytest — unit + integration)
 	@$(PY) -m pytest
-	$(call INFO,curl_tests.sh)
-	@./tests/curl_tests.sh
-	$(call INFO,negative_tests.sh)
-	@./tests/negative_tests.sh
 
 test-unit:  ## Run only pytest unit tests (no network, no subprocess)
 	$(call INFO,pytest -m unit)
@@ -134,10 +180,10 @@ test-integration:  ## Run only pytest integration tests (starts server subproces
 	$(call INFO,pytest -m integration)
 	@$(PY) -m pytest -m integration
 
-test-cov:  ## Run full pytest with coverage (HTML at htmlcov/, threshold in .coveragerc)
-	$(call INFO,pytest --cov — branch coverage, fail_under=70)
+test-cov:  ## Run full pytest with coverage (HTML at htmlcov/)
+	$(call INFO,pytest --cov — branch coverage)
 	@$(PY) -m pytest \
-		--cov=server --cov=middleware --cov=tls --cov=config \
+		--cov=server --cov=config \
 		--cov-report=html --cov-report=term-missing
 	$(call INFO,HTML report at htmlcov/index.html)
 
@@ -145,34 +191,38 @@ test-all:  ## Run unit tests then integration tests (sequential, distinct marker
 	@$(MAKE) --no-print-directory test-unit
 	@$(MAKE) --no-print-directory test-integration
 
-revoke:  ## Revoke client-01 and regenerate the CRL (server restart needed after)
+revoke:  ## Revoke client-01 and regenerate the CRL (nginx reload needed after)
 	$(call INFO,revoking pki/client/client.crt)
 	@./tests/revoke_client.sh
-	$(call WARN,CRL updated. Run: make stop && make server  — to apply.)
+	$(call WARN,CRL updated. Run: make nginx-reload  — to apply.)
 
 renew:  ## Rotate pki/client/client.crt to a fresh 24h-lived cert
 	$(call INFO,renewing client cert)
 	@./renew_client_cert.sh
 
-pin:  ## Extract server cert SHA-256 fingerprint into pki/server/server.fingerprint
-	@if [[ ! -f pki/server/server.crt ]]; then \
-		printf '%b[make]%b pki/server/server.crt missing — run `make pki` first\n' \
+pin:  ## Extract nginx cert SHA-256 fingerprint into pki/nginx/nginx.fingerprint
+	@if [[ ! -f pki/nginx/nginx.crt ]]; then \
+		printf '%b[make]%b pki/nginx/nginx.crt missing — run `make pki` first\n' \
 			"$(C_RED)" "$(C_RESET)" >&2; \
 		exit 1; \
 	fi
-	@openssl x509 -in pki/server/server.crt -noout -fingerprint -sha256 \
-		> pki/server/server.fingerprint
-	$(call INFO,pin written to pki/server/server.fingerprint:)
-	@cat pki/server/server.fingerprint
+	@openssl x509 -in pki/nginx/nginx.crt -noout -fingerprint -sha256 \
+		> pki/nginx/nginx.fingerprint
+	$(call INFO,pin written to pki/nginx/nginx.fingerprint:)
+	@cat pki/nginx/nginx.fingerprint
 
 clean:  ## Remove generated PKI artifacts, Python caches, server logs
 	$(call INFO,cleaning)
+	@$(MAKE) --no-print-directory nginx-stop || true
 	@$(MAKE) --no-print-directory stop
 	@rm -rf pki/ca/ca.key pki/ca/ca.crt pki/ca/ca.srl pki/ca/ca.crl \
 	        pki/ca/index.txt* pki/ca/serial* pki/ca/crlnumber* pki/ca/newcerts
 	@rm -rf pki/server/server.key pki/server/server.crt pki/server/server.csr \
 	        pki/server/server.fingerprint
+	@rm -rf pki/nginx/nginx.key pki/nginx/nginx.crt pki/nginx/nginx.csr \
+	        pki/nginx/nginx.fingerprint
 	@rm -rf pki/client/client.key pki/client/client.crt pki/client/client.csr
+	@rm -rf nginx/nginx-test.conf nginx/logs
 	@find . -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
-	@rm -f $(SERVER_LOG) $(PID_FILE)
+	@rm -f $(SERVER_LOG) $(PID_FILE) $(NGINX_LOG)
 	$(call INFO,done)

@@ -1,18 +1,21 @@
-"""Shared pytest fixtures for the mTLS ED25519 API test suite.
+"""Shared pytest fixtures for the mTLS ED25519 API test suite (v1.2).
 
-Three layers of fixtures live here:
+v1.2 architecture: nginx terminates mTLS on :8444, FastAPI listens on
+plain HTTP on :8443. This file exposes fixtures that mirror that split
+so individual test modules can target either layer:
 
-* ``pki_paths`` — resolves the on-disk CA/server/client cert/key paths
-  that ``./pki_setup.sh`` produces. Skips integration tests cleanly if
-  the PKI hasn't been generated yet.
-* ``client_ssl_context`` — a ready-to-use ``ssl.SSLContext`` for the
-  client side (our CA as trust anchor, client cert as identity).
-* ``server_process`` — session-scoped fixture that starts the real
-  FastAPI server as a subprocess bound to a free loopback port, waits
-  until ``/health`` answers over mTLS, yields a base URL, then
-  terminates the child. If port 8443 is occupied we pick a random free
-  port and pass it via the ``MTLS_API_PORT`` env var that ``server.py``
-  honours.
+* ``pki_paths`` — resolves on-disk CA/server/nginx/client cert paths.
+  Skips cleanly if ./pki_setup.sh has not been run yet.
+* ``plain_server`` — starts FastAPI (server.py) as a subprocess on a
+  free loopback port, plain HTTP only. For tests that want to exercise
+  the upstream directly, bypassing nginx.
+* ``client_ssl_context`` — a ready-to-use stdlib SSLContext configured
+  with our CA + client cert identity. For tests that want to talk
+  mTLS to nginx themselves.
+
+The actual nginx fixture lives in the N2v2 auth-test module because
+it owns its own port, config, and lifecycle — keeping it module-local
+avoids sprinkling test state through this shared conftest.
 """
 
 from __future__ import annotations
@@ -43,19 +46,19 @@ _SERVER_READY_POLL_S = 0.25
 
 @pytest.fixture(scope="session")
 def pki_paths() -> dict[str, Path]:
-    """Resolve the PKI material produced by ``./pki_setup.sh``.
+    """Resolve PKI material produced by ``./pki_setup.sh``.
 
-    Returns a dict keyed by role (``ca_cert``, ``server_cert``,
-    ``server_key``, ``client_cert``, ``client_key``, ``ca_crl``).
-    Skips the suite with a clear message if anything is missing —
-    this keeps CI failures attributable to "ran before pki_setup.sh"
-    rather than opaque TLS errors.
+    Returns a dict keyed by role. Skips the suite cleanly with a
+    readable message if anything is missing — so CI failures stay
+    attributable to "PKI missing" rather than opaque TLS errors.
     """
     paths = {
         "ca_cert": PKI_DIR / "ca" / "ca.crt",
         "ca_crl": PKI_DIR / "ca" / "ca.crl",
         "server_cert": PKI_DIR / "server" / "server.crt",
         "server_key": PKI_DIR / "server" / "server.key",
+        "nginx_cert": PKI_DIR / "nginx" / "nginx.crt",
+        "nginx_key": PKI_DIR / "nginx" / "nginx.key",
         "client_cert": PKI_DIR / "client" / "client.crt",
         "client_key": PKI_DIR / "client" / "client.key",
     }
@@ -72,12 +75,12 @@ def pki_paths() -> dict[str, Path]:
 
 @pytest.fixture(scope="session")
 def client_ssl_context(pki_paths: dict[str, Path]) -> ssl.SSLContext:
-    """Build a client-side SSLContext that mirrors the async client's posture.
+    """Client-side SSLContext that trusts our CA + presents client-01.
 
     SECURITY: ``CERT_REQUIRED`` and ``check_hostname=True`` are the
     stdlib defaults for ``create_default_context`` — we never flip
-    them off. ``verify=False`` and ``CERT_NONE`` would defeat the
-    server-identity half of mTLS.
+    them off. Tests that need to exercise a misconfigured client
+    must build their own context, not mutate this one.
     """
     ctx = ssl.create_default_context(
         purpose=ssl.Purpose.SERVER_AUTH,
@@ -90,16 +93,11 @@ def client_ssl_context(pki_paths: dict[str, Path]) -> ssl.SSLContext:
     return ctx
 
 
-# --- Server subprocess fixture ----------------------------------------------
+# --- Plain-HTTP FastAPI subprocess fixture ----------------------------------
 
 
 def _pick_free_port() -> int:
-    """Bind port 0, read the OS-chosen port, and release it.
-
-    There is an inherent race between releasing the socket and the
-    child process re-binding it, but for a single-process test run on
-    loopback the window is ~ms and we accept it.
-    """
+    """Bind port 0, read the OS-chosen port, and release it."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
@@ -111,23 +109,12 @@ def _port_in_use(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def _wait_for_health(
-    base_url: str,
-    ca_cert: Path,
-    client_cert: Path,
-    client_key: Path,
-    deadline: float,
-) -> None:
-    """Poll /health over mTLS until it returns 200 or we hit the deadline."""
+def _wait_for_plain_health(base_url: str, deadline: float) -> None:
+    """Poll /health over plain HTTP until 200 or deadline."""
     last_exc: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            r = requests.get(
-                f"{base_url}/health",
-                verify=str(ca_cert),
-                cert=(str(client_cert), str(client_key)),
-                timeout=2.0,
-            )
+            r = requests.get(f"{base_url}/health", timeout=2.0)
         except requests.exceptions.RequestException as exc:
             last_exc = exc
         else:
@@ -135,21 +122,18 @@ def _wait_for_health(
                 return
         time.sleep(_SERVER_READY_POLL_S)
     raise RuntimeError(
-        f"server at {base_url} did not become ready in "
+        f"plain-HTTP server at {base_url} did not become ready in "
         f"{_SERVER_READY_TIMEOUT_S}s (last error: {last_exc!r})"
     )
 
 
 @pytest.fixture(scope="session")
-def server_process(
-    pki_paths: dict[str, Path],
-) -> Iterator[dict[str, object]]:
-    """Start ``server.py`` as a subprocess; yield connection info; terminate.
+def plain_server() -> Iterator[dict[str, object]]:
+    """Start server.py on a free loopback port, plain HTTP.
 
-    If port 8443 is already bound (e.g. ``make server`` is running), the
-    fixture falls back to a random free port selected by the kernel.
-    This keeps the test run hermetic without requiring the dev to stop
-    their background server.
+    Tests that want to verify FastAPI's auth-blind contract (e.g. the
+    v1.2 structural suite and the SP1-SP8 plain-FastAPI tests) use
+    this fixture to hit the upstream directly, bypassing nginx.
     """
     port = (
         _DEFAULT_PORT
@@ -159,14 +143,8 @@ def server_process(
 
     env = os.environ.copy()
     env["MTLS_API_PORT"] = str(port)
-    # SECURITY: never disable TLS/cert checks for the child process; the
-    # server logic is unchanged — we only override the bind port here.
-
-    # Subprocess coverage: if we are running under pytest-cov (``coverage``
-    # is imported in the parent process) and a .coveragerc is on disk,
-    # point the child at it so ``sitecustomize.py`` can start recording.
-    # Data files land with a parallel suffix and pytest-cov combines them
-    # automatically at end-of-run.
+    # Subprocess coverage: if we're running under pytest-cov, forward
+    # the .coveragerc so sitecustomize.py can start recording.
     if "coverage" in sys.modules and (REPO_ROOT / ".coveragerc").is_file():
         env["COVERAGE_PROCESS_START"] = str(REPO_ROOT / ".coveragerc")
 
@@ -178,18 +156,11 @@ def server_process(
         stderr=subprocess.STDOUT,
     )
 
-    base_url = f"https://localhost:{port}"
+    base_url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + _SERVER_READY_TIMEOUT_S
     try:
-        _wait_for_health(
-            base_url=base_url,
-            ca_cert=pki_paths["ca_cert"],
-            client_cert=pki_paths["client_cert"],
-            client_key=pki_paths["client_key"],
-            deadline=deadline,
-        )
+        _wait_for_plain_health(base_url, deadline)
     except Exception:
-        # Drain whatever the child wrote so the failure is attributable.
         proc.terminate()
         try:
             out, _ = proc.communicate(timeout=5)
@@ -197,16 +168,13 @@ def server_process(
             proc.kill()
             out, _ = proc.communicate()
         sys.stderr.write(
-            f"\n[server_process] startup failed, child stdout:\n{out.decode(errors='replace')}\n"
+            f"\n[plain_server] startup failed, child stdout:\n"
+            f"{out.decode(errors='replace')}\n"
         )
         raise
 
     try:
-        yield {
-            "base_url": base_url,
-            "port": port,
-            "process": proc,
-        }
+        yield {"base_url": base_url, "port": port, "process": proc}
     finally:
         if proc.poll() is None:
             proc.terminate()
